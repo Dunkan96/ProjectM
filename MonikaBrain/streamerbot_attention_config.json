@@ -1,0 +1,53 @@
+{
+  "streamerbot_ws": {
+    "host": "127.0.0.1",
+    "port": 8081,
+    "endpoint": "/",
+    "password": "",
+    "subscribe": {
+      "Twitch": [
+        "ChatMessage",
+        "Follow",
+        "Cheer",
+        "Sub",
+        "ReSub",
+        "GiftSub",
+        "GiftBomb",
+        "Raid",
+        "RewardRedemption",
+        "StreamUpdate",
+        "UserTimedOut",
+        "UserBanned"
+      ],
+      "Obs": [
+        "Connected",
+        "Disconnected",
+        "SceneChanged",
+        "StreamingStarted",
+        "StreamingStopped",
+        "RecordingStarted",
+        "RecordingStopped",
+        "Event"
+      ]
+    }
+  },
+  "attention": {
+    "consume_after_digest": false,
+    "digest_limit": 8
+  },
+  "moderation": {
+    "mode": "dry_run",
+    "protected_users": [
+      "Duncan"
+    ],
+    "banned_terms": [],
+    "streamerbot_action_names": {
+      "warn_candidate": "",
+      "timeout_candidate": "",
+      "ban_candidate": "",
+      "vip_candidate": "",
+      "unvip_candidate": "",
+      "unban_candidate": ""
+    }
+  }
+}

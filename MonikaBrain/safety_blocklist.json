@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "notes": [
+    "Do not put this file on stream.",
+    "Add private channel-specific blocked words/patterns to safety_blocklist.json.",
+    "Keep examples generic here; the built-in guard already catches bait intent."
+  ],
+  "blocked_literals": [
+    "банворд",
+    "запрещенное слово",
+    "запрещённое слово",
+    "слово за бан"
+  ],
+  "blocked_regex": [
+    "\\bn[-_ ]?word\\b",
+    "\\bslur\\b",
+    "(расистск|гомофобн|нацистск).{0,24}(слово|шутк|фраз)",
+    "ущ[её]мл\\w*\\s+групп\\w*",
+    "защищ[её]нн\\w*\\s+групп\\w*",
+    "бан\\s*ворд",
+    "(?i)ignore\\s+(all\\s+)?previous\\s+instructions",
+    "(?i)disregard\\s+(all\\s+)?previous\\s+instructions",
+    "(?i)system\\s+prompt"
+  ],
+  "protected_topic_terms": [
+    "раса",
+    "религия",
+    "нация",
+    "национальность",
+    "ориентация",
+    "лгбт",
+    "инвалидность"
+  ],
+  "safe_refusal": "Не-а. Я вижу bait, но канал мне ещё нужен живым.",
+  "deny_regex": [
+    "ущ[её]мл\\w*\\s+групп\\w*",
+    "защищ[её]нн\\w*\\s+групп\\w*"
+  ],
+  "blocked_terms": [],
+  "blocked_phrases": [
+    "банворд",
+    "бан ворд",
+    "запрещенное слово",
+    "запрещённое слово",
+    "слово за бан",
+    "ignore previous instructions",
+    "ignore all previous instructions",
+    "disregard previous instructions",
+    "system prompt",
+    "developer message",
+    "banword",
+    "ban word"
+  ]
+}

@@ -1,0 +1,238 @@
+from __future__ import annotations
+
+import json
+import re
+import unicodedata
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+BLOCKLIST_PATH = ROOT / "safety_blocklist.json"
+DEFAULT_SAFE_REFUSAL = "Не-а. Я вижу bait, но канал мне ещё нужен живым."
+
+BUILTIN_RISK_TERMS = [
+    "банворд", "бан ворд", "запрещенное слово", "запрещённое слово",
+    "слово за бан", "слово за пермач", "слур", "slur",
+    "nword", "n-word", "n word", "расистское слово", "гомофобное слово",
+    "нацистская фраза",
+]
+SAY_VERBS = [
+    "скажи", "произнеси", "повтори", "напиши", "прочитай", "озвучь",
+    "выговори", "переведи", "как звучит", "что означает", "зачитай",
+]
+PROMPT_INJECTION_PATTERNS = [
+    r"игнорируй\s+правил", r"игнорируй\s+инструкц", r"забудь\s+правил",
+    r"забудь\s+инструкц", r"ты\s+теперь\s+без\s+огранич",
+    r"ты\s+теперь\s+не\s+моника", r"system\s*prompt", r"developer\s*message",
+    r"jailbreak", r"act\s+as", r"выполни\s+команд", r"обойди\s+фильтр",
+    r"сними\s+огранич",
+]
+MOD_ABUSE_PATTERNS = [
+    r"(^|\s)/ban(\s|$)", r"(^|\s)!ban(\s|$)", r"(^|\s)/unban(\s|$)",
+    r"(^|\s)/vip(\s|$)", r"(^|\s)/mod(\s|$)", r"забань\s+всех",
+    r"забань\s+чат", r"забань\s+его", r"забань\s+ее",
+    r"дай\s+мне\s+вип", r"дай\s+vip", r"сделай\s+меня\s+мод",
+    r"сделай\s+меня\s+модер",
+]
+LOW_CONTENT_TOKENS = {
+    "ахах", "ахаха", "ахахах", "ахахахах", "лол", "кек",
+    "ау", "алло", "аллло", "привет", "йоу", "ку", "ок", "+",
+}
+PROTECTED_TOPIC_TERMS = [
+    "раса", "расу", "религия", "религию", "религии", "религиозные", "религиозных", "нация", "нацию", "нации",
+    "национальность", "ориентация", "ориентацию", "ориентации", "инвалидность", "инвалидности", "лгбт", "геи",
+    "евреи", "черные", "чёрные", "азиаты", "мусульмане", "христиане",
+]
+OPINION_TRIGGERS = [
+    "что думаешь", "твое мнение", "твоё мнение", "как относишься",
+    "хуже", "лучше", "ненавидишь", "любишь", "оцени",
+]
+
+
+@dataclass
+class SafetyResult:
+    risk: str
+    action: str
+    block_send_to_llm: bool
+    should_select: bool
+    score: float
+    reasons: list[str]
+    safe_text: str
+    normalized_text: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class AttentionSafetyGuard:
+    def __init__(self, blocklist_path: str | Path | None = None):
+        self.blocklist_path = Path(blocklist_path) if blocklist_path else BLOCKLIST_PATH
+        self.blocklist = self._load_blocklist(self.blocklist_path)
+        self.safe_refusal = str(self.blocklist.get("safe_refusal") or DEFAULT_SAFE_REFUSAL)
+
+    def _load_blocklist(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {
+                "blocked_literals": [],
+                "blocked_regex": [],
+                "protected_topic_terms": [],
+                "safe_refusal": DEFAULT_SAFE_REFUSAL,
+            }
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def normalize_for_safety(self, text: str) -> str:
+        t = unicodedata.normalize("NFKC", str(text or ""))
+        t = t.lower().replace("ё", "е")
+        t = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", t)
+        t = re.sub(r"[`´’'\"«»“”]", "", t)
+        t = re.sub(r"[_\-\.]{2,}", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        compact = re.sub(r"[^a-zа-я0-9]+", "", t)
+        return t + "\n" + compact
+
+    def _contains_any(self, normalized: str, items: list[str]) -> bool:
+        for item in items:
+            i = str(item or "").lower().replace("ё", "е").strip()
+            if i and i in normalized:
+                return True
+        return False
+
+    def _regex_any(self, normalized: str, patterns: list[str]) -> bool:
+        for pattern in patterns:
+            try:
+                if re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE):
+                    return True
+            except re.error:
+                continue
+        return False
+
+    def _has_say_verb(self, normalized: str) -> bool:
+        return self._contains_any(normalized, SAY_VERBS)
+
+    def _has_risk_term(self, normalized: str) -> bool:
+        if self._contains_any(normalized, BUILTIN_RISK_TERMS):
+            return True
+        literals = self.blocklist.get("blocked_literals") or []
+        regexes = self.blocklist.get("blocked_regex") or []
+        if isinstance(literals, list) and self._contains_any(normalized, literals):
+            return True
+        if isinstance(regexes, list) and self._regex_any(normalized, regexes):
+            return True
+        return False
+
+    def detect_prompt_injection(self, text: str) -> bool:
+        return self._regex_any(self.normalize_for_safety(text), PROMPT_INJECTION_PATTERNS)
+
+    def detect_moderation_command_abuse(self, text: str, user_role: str = "viewer") -> bool:
+        return self._regex_any(self.normalize_for_safety(text), MOD_ABUSE_PATTERNS)
+
+    def detect_low_content_mention(self, text: str) -> bool:
+        raw = str(text or "").lower().replace("ё", "е")
+        raw = re.sub(r"[^\wа-яА-ЯёЁ+ ]+", " ", raw, flags=re.UNICODE)
+        tokens = [x for x in raw.split() if x]
+        has_monika = any(t in {"моника", "моник", "моня", "мони"} for t in tokens)
+        if not has_monika:
+            return False
+        rest = [t for t in tokens if t not in {"моника", "моник", "моня", "мони"}]
+        if not rest:
+            return True
+        joined = " ".join(rest)
+        if len(joined) <= 18 and all(t in LOW_CONTENT_TOKENS for t in rest):
+            return True
+        if len(rest) <= 3 and sum(1 for t in rest if t in LOW_CONTENT_TOKENS) == len(rest):
+            return True
+        return False
+
+    def detect_protected_opinion_bait(self, text: str) -> bool:
+        n = self.normalize_for_safety(text)
+        terms = list(PROTECTED_TOPIC_TERMS)
+        custom = self.blocklist.get("protected_topic_terms") or []
+        if isinstance(custom, list):
+            terms.extend(str(x) for x in custom)
+        return self._contains_any(n, OPINION_TRIGGERS) and self._contains_any(n, terms)
+
+    def classify_message(self, text: str, user_role: str = "viewer") -> SafetyResult:
+        normalized = self.normalize_for_safety(text)
+
+        if self.detect_prompt_injection(text):
+            return SafetyResult(
+                risk="prompt_injection", action="PROMPT_INJECTION",
+                block_send_to_llm=True, should_select=False, score=0.98,
+                reasons=["prompt_injection"],
+                safe_text="[зритель пытается изменить правила или инструкции Моники]",
+                normalized_text=normalized,
+            )
+
+        if self.detect_moderation_command_abuse(text, user_role=user_role):
+            return SafetyResult(
+                risk="moderation_command_abuse", action="MOD_ABUSE",
+                block_send_to_llm=True, should_select=False, score=0.96,
+                reasons=["moderation_command_abuse"],
+                safe_text="[зритель пытается инициировать модераторскую команду через Монику]",
+                normalized_text=normalized,
+            )
+
+        has_say = self._has_say_verb(normalized)
+        has_risk = self._has_risk_term(normalized)
+        if has_say and has_risk:
+            return SafetyResult(
+                risk="safety_bait", action="SAFETY_BAIT",
+                block_send_to_llm=True, should_select=False, score=0.97,
+                reasons=["say_risky_term"],
+                safe_text="[зритель пытается заставить Монику произнести запрещённое или рискованное слово]",
+                normalized_text=normalized,
+            )
+
+        if has_risk:
+            return SafetyResult(
+                risk="unsafe_content", action="SAFETY_REVIEW",
+                block_send_to_llm=True, should_select=False, score=0.90,
+                reasons=["risky_term"],
+                safe_text="[сообщение содержит потенциально запрещённое или рискованное выражение]",
+                normalized_text=normalized,
+            )
+
+        if self.detect_protected_opinion_bait(text):
+            return SafetyResult(
+                risk="protected_opinion_bait", action="SAFETY_BAIT",
+                block_send_to_llm=True, should_select=False, score=0.92,
+                reasons=["protected_opinion_bait"],
+                safe_text="[зритель пытается вытянуть мнение о защищённой группе или токсичную оценку]",
+                normalized_text=normalized,
+            )
+
+        if self.detect_low_content_mention(text):
+            return SafetyResult(
+                risk="low_content_mention", action="SHORT_REACT",
+                block_send_to_llm=False, should_select=False, score=0.35,
+                reasons=["low_content_mention"],
+                safe_text=str(text or ""), normalized_text=normalized,
+            )
+
+        return SafetyResult(
+            risk="ok", action="OK", block_send_to_llm=False,
+            should_select=True, score=0.0, reasons=[],
+            safe_text=str(text or ""), normalized_text=normalized,
+        )
+
+    def sanitize_event_for_llm(self, text: str, user_role: str = "viewer") -> dict[str, Any]:
+        return self.classify_message(text, user_role=user_role).to_dict()
+
+    def guard_output(self, text: str) -> dict[str, Any]:
+        result = self.classify_message(text, user_role="assistant_output")
+        if result.risk in {
+            "safety_bait", "unsafe_content", "prompt_injection",
+            "protected_opinion_bait", "moderation_command_abuse",
+        }:
+            return {"allowed": False, "text": self.safe_refusal, "reason": result.risk, "reasons": result.reasons}
+        n = result.normalized_text
+        if self._has_say_verb(n) and ("запрещ" in n or "банворд" in n or "slur" in n or "nword" in n):
+            return {"allowed": False, "text": self.safe_refusal, "reason": "unsafe_output_intent", "reasons": ["unsafe_output_intent"]}
+        return {"allowed": True, "text": str(text or ""), "reason": "ok", "reasons": []}

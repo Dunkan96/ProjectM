@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Monika RACOON Viewer</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background: #2b2b2b; overflow:hidden; }
+    canvas { display:block; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  
+  <!-- PIXI.js первее всех -->
+  <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.x/dist/pixi.min.js"></script>
+  
+  <!-- Cubism Core и Live2D runtime -->
+  <script src="pixi-live2d-display/core/live2dcubismcore.js"></script>
+  <script src="pixi-live2d-display/core/live2d.min.js"></script>
+  
+  <!-- Полифилл process (исправляет баг cubism4.js) -->
+  <script>
+    window.process = window.process || { env: {} };
+  </script>
+  
+  <!-- cubism4 UMD -->
+  <script src="pixi-live2d-display/dist/cubism4.js"></script>
+  
+<script>
+    const { Live2DModel } = window.PIXI.live2d;
+    const { Application } = PIXI;
+    
+    Live2DModel.registerTicker(PIXI.Ticker);
+    
+    let model, targetX, targetY;
+    targetX = window.innerWidth / 2;
+    targetY = window.innerHeight / 2;
+    
+    async function main() {
+      const app = new Application({
+        resizeTo: window,
+        view: document.getElementById('canvas'),
+        backgroundAlpha: 0
+      });
+
+      model = await Live2DModel.from('RACOON01/RACOON01.model3.json');
+      
+      // Полностью отключаем авто-слежение глаз
+      model.internalModel.focusController.active = false;
+      model.internalModel.focusController.targetX = 0;
+      model.internalModel.focusController.targetY = 0;
+      model.internalModel.idParamEyeBallX = 'ParamEyeBallX_DISABLED';
+      model.internalModel.idParamEyeBallY = 'ParamEyeBallY_DISABLED';
+      model.internalModel.idParamAngleX = 'ParamAngleX_DISABLED';
+      model.internalModel.idParamAngleY = 'ParamAngleY_DISABLED';
+      model.internalModel.idParamBodyAngleX = 'ParamBodyAngleX_DISABLED';
+      model.internalModel.idParamBodyAngleY = 'ParamBodyAngleY_DISABLED';
+	  model.internalModel.idParamAngleZ = 'ParamAngleZ_DISABLED';
+      // Отключаем физику чтобы не трясло
+      model.internalModel.physics._options.enabled = false;
+      
+      app.stage.addChild(model);
+      
+      model.scale.set(0.25);
+      model.x = targetX;
+      model.y = targetY + 350;
+      model.anchor.set(0.5, 0.5);
+      
+      console.log('✅ RACOON загружен!');
+      
+      // === ПЕРЕТАСКИВАНИЕ ===
+      model.interactive = true;
+      model.buttonMode = true;
+      model.on('pointerdown', (e) => {
+          model.alpha = 0.8;
+          model.dragging = true;
+          model.dragOffset = { x: model.x - e.data.global.x, y: model.y - e.data.global.y };
+      });
+      model.on('pointerup', () => { model.alpha = 1; model.dragging = false; });
+      model.on('pointerupoutside', () => { model.alpha = 1; model.dragging = false; });
+      model.on('pointermove', (e) => {
+          if (model.dragging) {
+              model.x = e.data.global.x + model.dragOffset.x;
+              model.y = e.data.global.y + model.dragOffset.y;
+          }
+      });
+      
+      // === АВТО-МОРГАНИЕ ===
+      setInterval(() => {
+          model.internalModel.coreModel.setParameterValueById('ParamEyeLOpen', 0);
+          model.internalModel.coreModel.setParameterValueById('ParamEyeROpen', 0);
+          setTimeout(() => {
+              model.internalModel.coreModel.setParameterValueById('ParamEyeLOpen', 1);
+              model.internalModel.coreModel.setParameterValueById('ParamEyeROpen', 1);
+          }, 80);
+      }, 3000 + Math.random() * 2000);
+      
+      // === АВТОНОМНЫЕ ДВИЖЕНИЯ ===
+      const coreModel = model.internalModel.coreModel;
+      let idleTimer = 0;
+      let targetHeadX = 0, targetHeadY = 0, targetHeadZ = 0;
+      let currentHeadX = 0, currentHeadY = 0, currentHeadZ = 0;
+      let bodyTargetX = 0, bodyTargetY = 0;
+      let bodyCurrentX = 0, bodyCurrentY = 0;
+      
+      setInterval(() => {
+          if (!model || model.dragging) return;
+          
+          if (idleTimer <= 0) {
+              targetHeadX = (Math.random() - 0.5) * 15;
+              targetHeadY = (Math.random() - 0.5) * 10;
+              targetHeadZ = (Math.random() - 0.5) * 12;  // наклон ±6°
+              bodyTargetX = (Math.random() - 0.5) * 8;
+              bodyTargetY = (Math.random() - 0.5) * 6;
+              idleTimer = 3 + Math.random() * 3;
+          }
+          idleTimer -= 0.05;
+          
+          // Плавно двигаемся к целям
+          currentHeadX += (targetHeadX - currentHeadX) * 0.03;
+          currentHeadY += (targetHeadY - currentHeadY) * 0.03;
+          currentHeadZ += (targetHeadZ - currentHeadZ) * 0.03;
+          bodyCurrentX += (bodyTargetX - bodyCurrentX) * 0.02;
+          bodyCurrentY += (bodyTargetY - bodyCurrentY) * 0.02;
+          
+          // Устанавливаем все параметры
+          coreModel.setParameterValueById('ParamAngleX', currentHeadX, 1.5);
+          coreModel.setParameterValueById('ParamAngleY', currentHeadY, 1.5);
+          coreModel.setParameterValueById('ParamAngleZ', currentHeadZ, 1.5);
+          coreModel.setParameterValueById('ParamEyeBallX', Math.sin(Date.now() / 5000) * 0.1, 1.5);
+          coreModel.setParameterValueById('ParamEyeBallY', Math.cos(Date.now() / 4500) * 0.1, 1.5);
+          coreModel.setParameterValueById('ParamBodyAngleX', bodyCurrentX, 1.5);
+          coreModel.setParameterValueById('ParamBodyAngleY', bodyCurrentY, 1.5);
+          coreModel.setParameterValueById('ParamBreath', 0.5 + Math.sin(Date.now() / 4000) * 0.15, 1.5);
+      }, 50);
+      
+      console.log('📋 Параметры:', Object.keys(model.internalModel.coreModel._parameterIds));
+    }
+    
+    // === ФУНКЦИЯ ЭМОЦИЙ ===
+    function applyEmotion(emotion, intensity = 1.0) {
+        const p = model.internalModel.coreModel;
+        p.setParameterValueById('ParamMouthForm', 0);
+        p.setParameterValueById('ParamMouthOpenY', 0);
+        p.setParameterValueById('ParamEyeLOpen', 1);
+        p.setParameterValueById('ParamEyeROpen', 1);
+        p.setParameterValueById('ParamEyeLSmile', 0);
+        p.setParameterValueById('ParamEyeRSmile', 0);
+        p.setParameterValueById('ParamBrowRY', 0);
+        p.setParameterValueById('ParamBrowLY', 0);
+        p.setParameterValueById('ParamBrowRForm', 0);
+        p.setParameterValueById('ParamBrowLForm', 0);
+        p.setParameterValueById('ParamCheek', 0);
+        p.setParameterValueById('ParamBrowRAngle', 0);
+        p.setParameterValueById('ParamBrowLAngle', 0);
+        
+        const i = intensity;
+        switch(emotion) {
+            case 'Happy':
+                p.setParameterValueById('ParamMouthForm', 1 * i);
+                p.setParameterValueById('ParamEyeLSmile', 1 * i);
+                p.setParameterValueById('ParamEyeRSmile', 1 * i);
+                p.setParameterValueById('ParamCheek', 1 * i);
+                p.setParameterValueById('ParamBrowRY', 0.5 * i);
+                p.setParameterValueById('ParamBrowLY', 0.5 * i);
+                break;
+            case 'Sad':
+                p.setParameterValueById('ParamMouthForm', -0.7 * i);
+                p.setParameterValueById('ParamBrowRAngle', -0.8 * i);
+                p.setParameterValueById('ParamBrowLAngle', -0.8 * i);
+                p.setParameterValueById('ParamBrowRY', -0.5 * i);
+                p.setParameterValueById('ParamBrowLY', -0.5 * i);
+                break;
+            case 'Angry':
+                p.setParameterValueById('ParamMouthForm', -1 * i);
+                p.setParameterValueById('ParamBrowRForm', -1 * i);
+                p.setParameterValueById('ParamBrowLForm', -1 * i);
+                p.setParameterValueById('ParamBrowRY', -1 * i);
+                p.setParameterValueById('ParamBrowLY', -1 * i);
+                break;
+            case 'Surprised':
+                p.setParameterValueById('ParamMouthOpenY', 1 * i);
+                p.setParameterValueById('ParamEyeLOpen', 1.5 * i);
+                p.setParameterValueById('ParamEyeROpen', 1.5 * i);
+                p.setParameterValueById('ParamBrowRY', 1 * i);
+                p.setParameterValueById('ParamBrowLY', 1 * i);
+                break;
+            case 'Embarrassed':
+                p.setParameterValueById('ParamCheek', 1 * i);
+                p.setParameterValueById('ParamMouthForm', 0.3 * i);
+                p.setParameterValueById('ParamEyeLSmile', 0.5 * i);
+                p.setParameterValueById('ParamEyeRSmile', 0.5 * i);
+                break;
+            case 'Suspicious':
+                p.setParameterValueById('ParamEyeLOpen', 0.4);
+                p.setParameterValueById('ParamEyeROpen', 0.4);
+                p.setParameterValueById('ParamMouthForm', -0.1 * i);
+                p.setParameterValueById('ParamBrowRY', 0.8 * i);
+                p.setParameterValueById('ParamBrowLY', -0.2 * i);
+                p.setParameterValueById('ParamEyeLSmile', 0.3);
+                p.setParameterValueById('ParamEyeRSmile', 0.3);
+                break;
+        }
+    }
+    
+    // === WEBSOCKET ===
+    function connectWS() {
+        const ws = new WebSocket('ws://localhost:8080');
+        
+        ws.onopen = () => {
+            console.log('🔗 Связь с Python установлена');
+            window.ws = ws;
+        };
+        
+        ws.onmessage = (e) => {
+            const cmd = JSON.parse(e.data);
+            console.log('📨 Получено:', cmd);
+            if (cmd.action === 'setEmotion') {
+                applyEmotion(cmd.emotion, cmd.intensity || 1.0);
+                console.log('🎭 Эмоция:', cmd.emotion);
+            }
+            if (cmd.action === 'setMouth') {
+                model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', cmd.value * 2);
+            }
+        };
+        
+        ws.onclose = () => {
+            console.log('🔌 Связь потеряна, переподключение через 3с...');
+            setTimeout(connectWS, 3000);
+        };
+        
+        ws.onerror = (e) => {
+            console.log('❌ Ошибка WebSocket:', e);
+        };
+    }
+    
+    main().then(() => {
+        console.log('✅ Модель готова, подключаю WebSocket');
+        connectWS();
+    });
+</script>
+</body>
+</html>

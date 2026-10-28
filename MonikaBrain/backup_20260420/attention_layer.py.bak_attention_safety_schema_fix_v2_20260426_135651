@@ -1,0 +1,412 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from attention_safety_guard import AttentionSafetyGuard
+
+
+ROOT = Path(__file__).resolve().parent
+LOG_DIR = ROOT / "Logs"
+RAW_EVENTS_LOG = LOG_DIR / "streamerbot_raw_events.jsonl"
+ATTENTION_EVENTS_LOG = LOG_DIR / "attention_events.jsonl"
+SELECTED_EVENTS_LOG = LOG_DIR / "monika_selected_events.jsonl"
+DIGEST_FILE = LOG_DIR / "monika_attention_digest.txt"
+
+
+def default_db_path() -> Path:
+    try:
+        import config  # type: ignore
+        for name in ("KNOWLEDGE_DB_PATH", "KNOWLEDGE_DB", "DB_PATH", "DATABASE_PATH"):
+            value = getattr(config, name, None)
+            if value:
+                return Path(value)
+    except Exception:
+        pass
+    return ROOT / "knowledge.db"
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _json(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+
+class AttentionLayer:
+    def __init__(self, db_path: str | Path | None = None, config: dict[str, Any] | None = None):
+        self.db_path = Path(db_path) if db_path else default_db_path()
+        self.config = config or {}
+        self.guard = AttentionSafetyGuard()
+        self.init_schema()
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_schema(self) -> None:
+        with self.connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS attention_events (
+                    event_id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    user_id TEXT,
+                    user_name TEXT,
+                    text TEXT,
+                    safe_text TEXT,
+                    score REAL NOT NULL DEFAULT 0,
+                    bucket TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    reasons_json TEXT NOT NULL DEFAULT '[]',
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    created_ts REAL NOT NULL,
+                    raw_json TEXT,
+                    safety_json TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS attention_selected (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_ts REAL NOT NULL,
+                    processed_ts REAL,
+                    FOREIGN KEY(event_id) REFERENCES attention_events(event_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS attention_viewer_state (
+                    user_id TEXT PRIMARY KEY,
+                    user_name TEXT,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    selected_count INTEGER NOT NULL DEFAULT 0,
+                    safety_count INTEGER NOT NULL DEFAULT 0,
+                    last_seen_ts REAL NOT NULL,
+                    last_message TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS attention_digest_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_ts REAL NOT NULL,
+                    digest TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_attention_events_created ON attention_events(created_ts);
+                CREATE INDEX IF NOT EXISTS idx_attention_events_bucket ON attention_events(bucket);
+                CREATE INDEX IF NOT EXISTS idx_attention_selected_status ON attention_selected(status);
+            """)
+            conn.commit()
+
+    def _write_jsonl(self, path: Path, item: dict[str, Any]) -> None:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def _record_event(self, event: dict[str, Any], selected: bool) -> dict[str, Any]:
+        self.init_schema()
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with self.connect() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO attention_events (
+                    event_id, source, event_type, user_id, user_name, text, safe_text,
+                    score, bucket, action, reasons_json, priority, created_ts, raw_json, safety_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event["event_id"], event["source"], event["event_type"],
+                event.get("user_id"), event.get("user_name"), event.get("text", ""),
+                event.get("safe_text", event.get("text", "")),
+                float(event.get("score", 0.0)), event.get("bucket", "ignored"),
+                event.get("action", "IGNORE"), _json(event.get("reasons", [])),
+                int(event.get("priority", 0)), float(event.get("created_ts", _now())),
+                _json(event.get("raw", {})), _json(event.get("safety", {})),
+            ))
+            if selected:
+                conn.execute(
+                    "INSERT OR IGNORE INTO attention_selected (event_id, status, created_ts) VALUES (?, 'pending', ?)",
+                    (event["event_id"], float(event.get("created_ts", _now()))),
+                )
+            if event["source"] == "twitch_chat":
+                self._update_viewer_state(conn, event)
+            conn.commit()
+
+        self._write_jsonl(ATTENTION_EVENTS_LOG, event)
+        if selected:
+            self._write_jsonl(SELECTED_EVENTS_LOG, event)
+        self.refresh_digest()
+        return event
+
+    def _update_viewer_state(self, conn: sqlite3.Connection, event: dict[str, Any]) -> None:
+        user_id = event.get("user_id") or event.get("user_name") or "unknown"
+        user_name = event.get("user_name") or user_id
+        selected_inc = 1 if event.get("bucket") in {"critical", "selected"} else 0
+        safety_inc = 1 if event.get("bucket") == "safety" or str(event.get("action", "")).startswith("SAFETY") else 0
+        conn.execute("""
+            INSERT INTO attention_viewer_state (
+                user_id, user_name, message_count, selected_count, safety_count,
+                last_seen_ts, last_message
+            )
+            VALUES (?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                user_name=excluded.user_name,
+                message_count=message_count + 1,
+                selected_count=selected_count + ?,
+                safety_count=safety_count + ?,
+                last_seen_ts=excluded.last_seen_ts,
+                last_message=excluded.last_message
+        """, (
+            user_id, user_name, selected_inc, safety_inc,
+            float(event.get("created_ts", _now())), event.get("text", ""),
+            selected_inc, safety_inc,
+        ))
+
+    def process_creator(self, text: str, user_id: str = "Duncan", user_name: str = "Duncan") -> dict[str, Any]:
+        event = {
+            "event_id": "creator_" + uuid.uuid4().hex[:16],
+            "source": "creator_voice",
+            "event_type": "voice",
+            "user_id": user_id,
+            "user_name": user_name,
+            "text": str(text or ""),
+            "safe_text": str(text or ""),
+            "score": 1.0,
+            "bucket": "critical",
+            "action": "ANSWER_CREATOR",
+            "reasons": ["creator"],
+            "priority": 100,
+            "created_ts": _now(),
+            "raw": {},
+            "safety": {"risk": "creator"},
+        }
+        return self._record_event(event, selected=True)
+
+    def process_twitch_chat(self, data: dict[str, Any], raw: dict[str, Any] | None = None) -> dict[str, Any]:
+        user_name = (
+            data.get("displayName") or data.get("userName") or data.get("username")
+            or data.get("user") or data.get("login") or "unknown"
+        )
+        user_id = data.get("userId") or data.get("user_id") or data.get("id") or user_name
+        text = data.get("message") or data.get("text") or data.get("rawInput") or data.get("input") or ""
+        role = self._infer_role(data)
+        safety = self.guard.classify_message(text, user_role=role)
+        score, bucket, action, reasons, priority, selected = self._score_twitch_message(
+            text=str(text), role=role, safety=safety.to_dict()
+        )
+        event = {
+            "event_id": "tw_" + uuid.uuid4().hex[:16],
+            "source": "twitch_chat",
+            "event_type": "ChatMessage",
+            "user_id": str(user_id),
+            "user_name": str(user_name),
+            "text": str(text),
+            "safe_text": safety.safe_text,
+            "score": score,
+            "bucket": bucket,
+            "action": action,
+            "reasons": reasons,
+            "priority": priority,
+            "created_ts": _now(),
+            "raw": raw or data,
+            "safety": safety.to_dict(),
+        }
+        return self._record_event(event, selected=selected)
+
+    def _infer_role(self, data: dict[str, Any]) -> str:
+        raw = json.dumps(data, ensure_ascii=False).lower()
+        if "broadcaster" in raw:
+            return "broadcaster"
+        if "moderator" in raw or '"mod"' in raw:
+            return "moderator"
+        if "vip" in raw:
+            return "vip"
+        if "subscriber" in raw:
+            return "subscriber"
+        return "viewer"
+
+    def _mentions_monika(self, text: str) -> bool:
+        t = str(text or "").lower().replace("ё", "е")
+        return any(x in t for x in ("моника", "моник", "моня", "мони"))
+
+    def _looks_question(self, text: str) -> bool:
+        t = str(text or "").lower().replace("ё", "е")
+        if "?" in t:
+            return True
+        return any(x in t for x in ("как ", "что ", "кто ", "почему ", "зачем ", "где ", "когда ", "можешь", "умеешь"))
+
+    def _is_urgent_stream_report(self, text: str) -> bool:
+        t = str(text or "").lower().replace("ё", "е")
+        return any(x in t for x in ("звук пропал", "нет звука", "лагает", "не видно", "черный экран", "чёрный экран", "микрофон"))
+
+    def _score_twitch_message(
+        self, text: str, role: str, safety: dict[str, Any]
+    ) -> tuple[float, str, str, list[str], int, bool]:
+        reasons: list[str] = []
+        safety_action = str(safety.get("action") or "")
+        safety_risk = str(safety.get("risk") or "")
+        if safety.get("block_send_to_llm"):
+            reasons.extend(safety.get("reasons") or [safety_risk])
+            return float(safety.get("score") or 0.95), "safety", safety_action or "SAFETY_REVIEW", reasons, 80, False
+
+        if safety_action == "SHORT_REACT":
+            reasons.extend(safety.get("reasons") or ["low_content_mention"])
+            return 0.35, "background", "SHORT_REACT", reasons, 30, False
+
+        t = str(text or "").strip()
+        if not t:
+            return 0.0, "ignored", "IGNORE", ["empty"], 0, False
+
+        low = t.lower().replace("ё", "е")
+        mentions = self._mentions_monika(t)
+        question = self._looks_question(t)
+        urgent = self._is_urgent_stream_report(t)
+        score = 0.0
+        priority = 20
+
+        if mentions:
+            score += 0.48
+            priority += 25
+            reasons.append("mentions_monika")
+        if question:
+            score += 0.23
+            priority += 10
+            reasons.append("question")
+        if urgent:
+            score += 0.45
+            priority += 25
+            reasons.append("stream_issue")
+        if role in {"broadcaster", "moderator"}:
+            score += 0.10
+            priority += 10
+            reasons.append(role)
+        if len(t) <= 3:
+            score -= 0.40
+            reasons.append("too_short")
+        if re.fullmatch(r"(а?ха)+х?|лол|кек|ау|ал+о+", low):
+            score -= 0.45
+            reasons.append("low_content")
+
+        score = max(0.0, min(1.0, score))
+        if urgent and score >= 0.65:
+            return score, "critical", "ANSWER_VIEWER", reasons, min(priority, 90), True
+        if mentions and score >= 0.60:
+            return score, ("critical" if score >= 0.85 else "selected"), "ANSWER_VIEWER", reasons, min(priority, 80), True
+        if question and score >= 0.38:
+            return score, "background", "REMEMBER_CONTEXT", reasons or ["question_context"], min(priority, 50), False
+        if score >= 0.55:
+            return score, "selected", "ANSWER_VIEWER", reasons, min(priority, 70), True
+        if score >= 0.25:
+            return score, "background", "REMEMBER_CONTEXT", reasons or ["context"], min(priority, 40), False
+        return score, "ignored", "IGNORE", reasons or ["low_score"], 0, False
+
+    def process_obs_event(self, event_type: str, data: dict[str, Any] | None = None, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = data or {}
+        text = data.get("sceneName") or data.get("name") or event_type
+        event = {
+            "event_id": "obs_" + uuid.uuid4().hex[:16],
+            "source": "obs",
+            "event_type": str(event_type),
+            "user_id": "OBS",
+            "user_name": "OBS",
+            "text": str(text),
+            "safe_text": str(text),
+            "score": 0.55,
+            "bucket": "background",
+            "action": "OBS_CONTEXT",
+            "reasons": ["obs_event"],
+            "priority": 45,
+            "created_ts": _now(),
+            "raw": raw or data,
+            "safety": {"risk": "ok"},
+        }
+        return self._record_event(event, selected=False)
+
+    def process_streamerbot_event(self, raw: dict[str, Any]) -> dict[str, Any] | None:
+        event_meta = raw.get("event") or {}
+        source = event_meta.get("source")
+        event_type = event_meta.get("type")
+        data = raw.get("data") or {}
+        self._write_jsonl(RAW_EVENTS_LOG, raw)
+        if source == "Twitch" and event_type == "ChatMessage":
+            return self.process_twitch_chat(data, raw=raw)
+        if source == "Obs":
+            return self.process_obs_event(str(event_type), data=data, raw=raw)
+        return None
+
+    def fetch_pending_selected(self, limit: int = 5) -> list[dict[str, Any]]:
+        self.init_schema()
+        with self.connect() as conn:
+            rows = conn.execute("""
+                SELECT e.*
+                FROM attention_selected s
+                JOIN attention_events e ON e.event_id = s.event_id
+                WHERE s.status = 'pending'
+                ORDER BY e.priority DESC, e.score DESC, e.created_ts ASC
+                LIMIT ?
+            """, (int(limit),)).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
+    def mark_processed(self, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        self.init_schema()
+        with self.connect() as conn:
+            conn.executemany(
+                "UPDATE attention_selected SET status='processed', processed_ts=? WHERE event_id=?",
+                [(time.time(), event_id) for event_id in event_ids],
+            )
+            conn.commit()
+        self.refresh_digest()
+
+    def refresh_digest(self, limit: int = 5) -> str:
+        pending = self.fetch_pending_selected(limit=limit)
+        if not pending:
+            digest = ""
+        else:
+            lines = ["### STREAM ATTENTION"]
+            for e in pending:
+                reasons = ", ".join(e.get("reasons", []))
+                safe_text = e.get("safe_text") or e.get("text") or ""
+                lines.append(
+                    f"- [{e.get('action')}] score={float(e.get('score', 0)):.2f} "
+                    f"prio={e.get('priority')} from={e.get('user_name')}: {safe_text}"
+                    + (f" ({reasons})" if reasons else "")
+                )
+            digest = "\n".join(lines)
+
+        DIGEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DIGEST_FILE.write_text(digest, encoding="utf-8")
+        with self.connect() as conn:
+            conn.execute("INSERT INTO attention_digest_log (created_ts, digest) VALUES (?, ?)", (_now(), digest))
+            conn.commit()
+        return digest
+
+    def _row_to_event(self, row: sqlite3.Row) -> dict[str, Any]:
+        def loads(value: Any, default: Any) -> Any:
+            try:
+                return json.loads(value) if value else default
+            except Exception:
+                return default
+
+        return {
+            "event_id": row["event_id"],
+            "source": row["source"],
+            "event_type": row["event_type"],
+            "user_id": row["user_id"],
+            "user_name": row["user_name"],
+            "text": row["text"],
+            "safe_text": row["safe_text"],
+            "score": row["score"],
+            "bucket": row["bucket"],
+            "action": row["action"],
+            "reasons": loads(row["reasons_json"], []),
+            "priority": row["priority"],
+            "created_ts": row["created_ts"],
+            "raw": loads(row["raw_json"], {}),
+            "safety": loads(row["safety_json"], {}),
+        }

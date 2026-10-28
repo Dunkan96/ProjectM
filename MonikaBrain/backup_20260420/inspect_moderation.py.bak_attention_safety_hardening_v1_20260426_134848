@@ -1,0 +1,20 @@
+from __future__ import annotations
+from moderation_governor import ModerationGovernor
+
+def main():
+    gov = ModerationGovernor()
+    print("Moderation summary:")
+    print(gov.summary())
+    print()
+    with gov.connect() as conn:
+        rows = conn.execute("SELECT * FROM moderation_actions ORDER BY created_ts DESC LIMIT 20").fetchall()
+    print("Recent moderation actions:")
+    if not rows:
+        print("  <empty>")
+    for r in rows:
+        print(f"- [{r['status']}] {r['action']} severity={r['severity']} user={r['user_name']} reason={r['reason']} dry_run={r['dry_run']}")
+        if r["message"]:
+            print("  msg:", str(r["message"])[:180])
+
+if __name__ == "__main__":
+    main()

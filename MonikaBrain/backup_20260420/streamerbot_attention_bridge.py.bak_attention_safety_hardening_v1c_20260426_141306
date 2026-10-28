@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+
+from attention_layer import AttentionLayer
+from moderation_governor import ModerationGovernor
+
+
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / "streamerbot_attention_config.json"
+
+DEFAULT_CONFIG = {
+    "streamerbot": {"host": "127.0.0.1", "port": 8081, "endpoint": "/"},
+    "moderation": {"dry_run": True},
+    "events": {
+        "Twitch": [
+            "ChatMessage", "Follow", "Cheer", "Sub", "ReSub", "GiftSub",
+            "GiftBomb", "Raid", "RewardRedemption", "StreamUpdate",
+            "UserTimedOut", "UserBanned",
+        ],
+        "Obs": [
+            "Connected", "Disconnected", "SceneChanged", "StreamingStarted",
+            "StreamingStopped", "RecordingStarted", "RecordingStopped", "Event",
+        ],
+    },
+}
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
+        return DEFAULT_CONFIG
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return DEFAULT_CONFIG
+    except Exception:
+        return DEFAULT_CONFIG
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(data)
+    cfg["streamerbot"] = {**DEFAULT_CONFIG["streamerbot"], **dict(data.get("streamerbot") or {})}
+    cfg["events"] = {**DEFAULT_CONFIG["events"], **dict(data.get("events") or {})}
+    cfg["moderation"] = {**DEFAULT_CONFIG["moderation"], **dict(data.get("moderation") or {})}
+    return cfg
+
+
+def build_url(config: dict[str, Any]) -> str:
+    sb = config["streamerbot"]
+    endpoint = str(sb.get("endpoint", "/") or "/")
+    if not endpoint.startswith("/"):
+        endpoint = "/" + endpoint
+    return f"ws://{sb.get('host', '127.0.0.1')}:{int(sb.get('port', 8081))}{endpoint}"
+
+
+async def send_json(ws: Any, payload: dict[str, Any]) -> None:
+    await ws.send(json.dumps(payload, ensure_ascii=False))
+
+
+async def run_bridge(config: dict[str, Any]) -> None:
+    try:
+        import websockets
+    except ImportError as exc:
+        raise SystemExit("Missing dependency: run `python -m pip install websockets`") from exc
+
+    attention = AttentionLayer(config=config)
+    moderation = ModerationGovernor(
+        dry_run=bool(config.get("moderation", {}).get("dry_run", True)),
+        config=config,
+    )
+
+    url = build_url(config)
+    print(f"[connect] {url}")
+    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+        await send_json(ws, {"request": "GetInfo", "id": "monika-get-info"})
+        await send_json(ws, {"request": "Subscribe", "id": "monika-attention-subscribe", "events": config["events"]})
+        print("[subscribe]", json.dumps(config["events"], ensure_ascii=False))
+        print("[mode] moderation:", "dry_run" if moderation.dry_run else "pending")
+
+        while True:
+            message = await ws.recv()
+            try:
+                raw = json.loads(message)
+            except json.JSONDecodeError:
+                print("[skip] non-json", str(message)[:200])
+                continue
+
+            if raw.get("status") or raw.get("id"):
+                print("[server]", json.dumps(raw, ensure_ascii=False)[:1000])
+                continue
+
+            event = attention.process_streamerbot_event(raw)
+            if not event:
+                continue
+            mod_actions = moderation.evaluate_event(event)
+            _print_event(event, mod_actions)
+
+
+def _print_event(event: dict[str, Any], mod_actions: list[dict[str, Any]]) -> None:
+    source = event.get("source")
+    user = event.get("user_name")
+    text = event.get("text") or event.get("safe_text") or ""
+    bucket = event.get("bucket")
+    action = event.get("action")
+    score = float(event.get("score", 0.0))
+
+    if source == "twitch_chat":
+        print(f"[chat:{bucket}] {user}: {text} score={score:.2f} action={action}")
+    elif source == "obs":
+        print(f"[obs:{bucket}] {event.get('event_type')}: {text} action={action}")
+    else:
+        print(f"[event:{bucket}] {source}/{event.get('event_type')}: {text} action={action}")
+
+    for item in mod_actions:
+        print(f"[moderation:{item.get('status')}] {item.get('action')} user={item.get('user_name')} reason={item.get('reason')}")
+
+
+def inject_creator(text: str) -> None:
+    event = AttentionLayer().process_creator(text)
+    print(json.dumps(event, ensure_ascii=False, indent=2))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--inject-creator", help="Inject creator voice/text event into attention queue")
+    args = parser.parse_args()
+    if args.inject_creator:
+        inject_creator(args.inject_creator)
+        return
+    try:
+        asyncio.run(run_bridge(load_config()))
+    except KeyboardInterrupt:
+        print("\n[stop]")
+
+
+if __name__ == "__main__":
+    main()

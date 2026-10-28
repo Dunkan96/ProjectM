@@ -1,0 +1,288 @@
+from __future__ import annotations
+import json, re, sqlite3, time, uuid
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+LOGS = ROOT / "Logs"
+
+def resolve_db_path(db_path=None) -> Path:
+    if db_path:
+        return Path(db_path)
+    try:
+        import config  # type: ignore
+        for name in ("KNOWLEDGE_DB_PATH", "DB_PATH", "DATABASE_PATH"):
+            value = getattr(config, name, None)
+            if value:
+                return Path(value)
+    except Exception:
+        pass
+    return ROOT / "knowledge.db"
+
+def now_ts() -> float:
+    return time.time()
+
+def iso_now() -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S")
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").replace("\u00a0", " ")).strip()
+
+def text_lc(text: str) -> str:
+    return normalize_text(text).casefold()
+
+def stable_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+def token_count(text: str) -> int:
+    return len(re.findall(r"[\wА-Яа-яЁё]+", text, flags=re.UNICODE))
+
+@dataclass
+class AttentionDecision:
+    event_id: str
+    source: str
+    event_type: str
+    user_id: str
+    user_name: str
+    text: str
+    score: float
+    bucket: str
+    action: str
+    reasons: list[str]
+    priority: int
+    created_ts: float
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+class AttentionLayer:
+    def __init__(self, db_path=None):
+        self.db_path = resolve_db_path(db_path)
+        LOGS.mkdir(parents=True, exist_ok=True)
+        self.init_schema()
+
+    def connect(self):
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_schema(self):
+        with self.connect() as conn:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS attention_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT UNIQUE,
+                source TEXT, event_type TEXT,
+                user_id TEXT, user_name TEXT, text TEXT,
+                raw_json TEXT,
+                score REAL, bucket TEXT, action TEXT, reasons_json TEXT,
+                priority INTEGER, selected INTEGER DEFAULT 0, consumed INTEGER DEFAULT 0,
+                created_ts REAL, created_at TEXT
+            )""")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS attention_selected(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT UNIQUE,
+                source TEXT, event_type TEXT,
+                user_id TEXT, user_name TEXT, text TEXT,
+                score REAL, action TEXT, reasons_json TEXT,
+                priority INTEGER, consumed INTEGER DEFAULT 0,
+                created_ts REAL, created_at TEXT
+            )""")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS attention_viewer_state(
+                user_id TEXT PRIMARY KEY,
+                user_name TEXT, message_count INTEGER DEFAULT 0,
+                last_text TEXT, last_text_count INTEGER DEFAULT 0,
+                last_seen_ts REAL, last_seen_at TEXT
+            )""")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS attention_digest_log(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                digest TEXT, event_count INTEGER,
+                created_ts REAL, created_at TEXT
+            )""")
+            conn.commit()
+
+    def _repeat_info(self, conn, user_id: str, user_name: str, text: str) -> tuple[int, int]:
+        if not user_id:
+            return 0, 0
+        norm = text_lc(text)
+        row = conn.execute("SELECT message_count,last_text,last_text_count FROM attention_viewer_state WHERE user_id=?", (user_id,)).fetchone()
+        if row is None:
+            conn.execute("""INSERT INTO attention_viewer_state(user_id,user_name,message_count,last_text,last_text_count,last_seen_ts,last_seen_at)
+                            VALUES(?,?,?,?,?,?,?)""", (user_id, user_name, 1, norm, 1, now_ts(), iso_now()))
+            return 1, 1
+        message_count = int(row["message_count"] or 0) + 1
+        repeat = int(row["last_text_count"] or 0) + 1 if str(row["last_text"] or "") == norm and norm else 1
+        conn.execute("""UPDATE attention_viewer_state
+                        SET user_name=?, message_count=?, last_text=?, last_text_count=?, last_seen_ts=?, last_seen_at=?
+                        WHERE user_id=?""",
+                     (user_name, message_count, norm, repeat, now_ts(), iso_now(), user_id))
+        return message_count, repeat
+
+    def score_creator_event(self, text: str, event_type="voice") -> AttentionDecision:
+        return AttentionDecision(stable_id("creator"), "creator_voice", event_type, "Duncan", "Duncan",
+                                 normalize_text(text), 1.0, "critical", "ANSWER_CREATOR", ["creator"], 100, now_ts())
+
+    def score_vision_event(self, data: dict[str, Any]) -> AttentionDecision:
+        typ = str(data.get("event_type") or data.get("type") or "vision")
+        text = normalize_text(data.get("text") or data.get("summary") or data.get("sceneName") or data.get("obs.sceneName") or "")
+        reasons = ["vision_or_obs"]
+        score, priority, action = 0.45, 45, "REMEMBER_CONTEXT"
+        lc = text_lc(text)
+        if typ in {"SceneChanged","StreamingStarted","StreamingStopped","RecordingStarted","RecordingStopped"}:
+            score += 0.15; priority += 15; reasons.append("obs_state_change")
+        if any(x in lc for x in ("dark souls","elden ring","босс","смерть","костёр","hp","игра")):
+            score += 0.18; priority += 10; reasons.append("game_or_scene_signal")
+        bucket = "selected" if score >= 0.7 else "background"
+        if bucket == "selected":
+            action = "COMMENT_SCREEN"
+        return AttentionDecision(stable_id("vision"), str(data.get("source") or "vision_context"), typ, "", "",
+                                 text, round(min(score,1.0),3), bucket, action, reasons, min(priority,90), now_ts())
+
+    def score_twitch_message(self, data: dict[str, Any], conn=None) -> AttentionDecision:
+        text = normalize_text(data.get("message") or data.get("text") or data.get("rawInput") or data.get("input") or "")
+        user_name = str(data.get("displayName") or data.get("user_name") or data.get("userName") or data.get("username") or data.get("login") or "")
+        user_id = str(data.get("user_id") or data.get("userId") or data.get("id") or user_name or "")
+        lc = text_lc(text)
+        reasons: list[str] = []
+        score, priority = 0.18, 25
+        repeat = 0
+        if conn is not None:
+            _, repeat = self._repeat_info(conn, user_id, user_name, text)
+        if not text:
+            score -= 1; reasons.append("empty")
+        if len(text) > 400:
+            score -= .35; reasons.append("too_long")
+        if token_count(text) <= 1 and not any(x in lc for x in ("мони","monika","?")):
+            score -= .25; reasons.append("too_short")
+        if repeat >= 3:
+            score -= .65; reasons.append("repeat_spam")
+        if re.search(r"(.)\1{8,}", text):
+            score -= .25; reasons.append("char_spam")
+        if any(x in lc for x in ("моника","моник","monika","@monika","мона")):
+            score += .45; priority += 25; reasons.append("mentions_monika")
+        if "?" in text or re.search(r"\b(как|что|почему|зачем|когда|где|кто|можешь|скажешь|думаешь)\b", lc):
+            score += .25; priority += 10; reasons.append("question")
+        if any(x in lc for x in ("звук пропал","нет звука","не слышно","лагает","стрим упал","экран чёрный","черный экран")):
+            score += .55; priority += 40; reasons.append("stream_health")
+        badges = text_lc(str(data.get("badges") or ""))
+        if "broadcaster" in badges:
+            score += .65; priority += 40; reasons.append("broadcaster")
+        elif "moderator" in badges:
+            score += .22; priority += 12; reasons.append("moderator")
+        elif "vip" in badges:
+            score += .18; priority += 10; reasons.append("vip")
+        elif "subscriber" in badges:
+            score += .12; priority += 8; reasons.append("subscriber")
+        if "http://" in lc or "https://" in lc:
+            score -= .2; reasons.append("link")
+        score = round(max(0.0, min(score, 1.0)), 3)
+        if score >= .85:
+            bucket, action = "critical", "ANSWER_VIEWER"
+        elif score >= .62:
+            bucket, action = "selected", "ANSWER_VIEWER"
+        elif score >= .38:
+            bucket, action = "background", "REMEMBER_CONTEXT"
+        else:
+            bucket, action = "ignored", "IGNORE"
+        if "stream_health" in reasons:
+            action = "ALERT_CREATOR"
+        return AttentionDecision(str(data.get("messageId") or data.get("event_id") or stable_id("tw")),
+                                 "twitch_chat", "ChatMessage", user_id, user_name, text, score, bucket,
+                                 action, reasons, max(0,min(priority,100)), now_ts())
+
+    def enqueue_decision(self, d: AttentionDecision, raw: dict[str, Any] | None = None) -> AttentionDecision:
+        reasons_json = json.dumps(d.reasons, ensure_ascii=False)
+        raw_json = json.dumps(raw or {}, ensure_ascii=False)
+        selected = 1 if d.bucket in ("selected","critical") else 0
+        with self.connect() as conn:
+            conn.execute("""INSERT OR IGNORE INTO attention_events(
+                event_id,source,event_type,user_id,user_name,text,raw_json,score,bucket,action,reasons_json,priority,selected,consumed,created_ts,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
+                (d.event_id,d.source,d.event_type,d.user_id,d.user_name,d.text,raw_json,d.score,d.bucket,d.action,reasons_json,d.priority,selected,d.created_ts,iso_now()))
+            if selected:
+                conn.execute("""INSERT OR IGNORE INTO attention_selected(
+                    event_id,source,event_type,user_id,user_name,text,score,action,reasons_json,priority,consumed,created_ts,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?)""",
+                    (d.event_id,d.source,d.event_type,d.user_id,d.user_name,d.text,d.score,d.action,reasons_json,d.priority,d.created_ts,iso_now()))
+            conn.commit()
+        self._jsonl(LOGS / "attention_events.jsonl", {"decision": d.to_dict(), "raw": raw or {}})
+        if selected:
+            self._jsonl(LOGS / "monika_selected_events.jsonl", d.to_dict())
+        return d
+
+    def enqueue_twitch_message(self, data: dict[str, Any], raw: dict[str, Any] | None = None) -> AttentionDecision:
+        with self.connect() as conn:
+            d = self.score_twitch_message(data, conn=conn)
+            conn.commit()
+        return self.enqueue_decision(d, raw or data)
+
+    def enqueue_creator_message(self, text: str, event_type="voice") -> AttentionDecision:
+        return self.enqueue_decision(self.score_creator_event(text, event_type), {"text": text, "event_type": event_type})
+
+    def enqueue_vision_event(self, data: dict[str, Any], raw: dict[str, Any] | None = None) -> AttentionDecision:
+        return self.enqueue_decision(self.score_vision_event(data), raw or data)
+
+    def get_selected(self, limit=10, consume=False) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("""SELECT * FROM attention_selected WHERE consumed=0
+                                   ORDER BY priority DESC, score DESC, created_ts ASC LIMIT ?""", (limit,)).fetchall()
+            items = [dict(r) for r in rows]
+            if consume and items:
+                ids = [i["event_id"] for i in items]
+                q = ",".join("?" for _ in ids)
+                conn.execute(f"UPDATE attention_selected SET consumed=1 WHERE event_id IN ({q})", ids)
+                conn.execute(f"UPDATE attention_events SET consumed=1 WHERE event_id IN ({q})", ids)
+                conn.commit()
+        return items
+
+    def build_digest(self, limit=8, consume=False) -> str:
+        items = self.get_selected(limit, consume)
+        if not items:
+            return ""
+        lines = ["### STREAM ATTENTION"]
+        for i in items:
+            reasons = ", ".join(json.loads(i.get("reasons_json") or "[]"))
+            who = i.get("user_name") or i.get("source") or "event"
+            text = normalize_text(i.get("text") or "")
+            if len(text) > 220:
+                text = text[:217].rstrip() + "..."
+            lines.append(f"- [{i['action']}] score={i['score']} prio={i['priority']} from={who}: {text}" + (f" ({reasons})" if reasons else ""))
+        digest = "\n".join(lines)
+        with self.connect() as conn:
+            conn.execute("INSERT INTO attention_digest_log(digest,event_count,created_ts,created_at) VALUES(?,?,?,?)",
+                         (digest, len(items), now_ts(), iso_now()))
+            conn.commit()
+        (LOGS / "monika_attention_digest.txt").write_text(digest, encoding="utf-8")
+        return digest
+
+    def summary(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            total = conn.execute("SELECT COUNT(*) c FROM attention_events").fetchone()["c"]
+            selected = conn.execute("SELECT COUNT(*) c FROM attention_selected").fetchone()["c"]
+            pending = conn.execute("SELECT COUNT(*) c FROM attention_selected WHERE consumed=0").fetchone()["c"]
+            buckets = {r["bucket"]: r["c"] for r in conn.execute("SELECT bucket, COUNT(*) c FROM attention_events GROUP BY bucket")}
+            sources = {r["source"]: r["c"] for r in conn.execute("SELECT source, COUNT(*) c FROM attention_events GROUP BY source")}
+        return {"attention_events": total, "attention_selected": selected, "pending_selected": pending, "by_bucket": buckets, "by_source": sources}
+
+    @staticmethod
+    def _jsonl(path: Path, obj: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def demo_selftest(db_path) -> dict[str, Any]:
+    layer = AttentionLayer(db_path)
+    d1 = layer.enqueue_twitch_message({"displayName":"viewer1","userId":"1","message":"лол"})
+    d2 = layer.enqueue_twitch_message({"displayName":"viewer2","userId":"2","message":"Моника, что думаешь про Dark Souls?"})
+    d3 = layer.enqueue_creator_message("Моника, проверь чат")
+    d4 = layer.enqueue_vision_event({"source":"obs","event_type":"SceneChanged","sceneName":"Dark Souls gameplay"})
+    assert d1.bucket == "ignored", d1
+    assert d2.bucket in ("selected","critical"), d2
+    assert d3.score == 1.0 and d3.priority == 100, d3
+    assert d4.bucket in ("background","selected"), d4
+    assert "STREAM ATTENTION" in layer.build_digest(limit=5)
+    return layer.summary()

@@ -1,0 +1,152 @@
+from __future__ import annotations
+import json, re, sqlite3, time, uuid
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any
+from attention_layer import resolve_db_path, normalize_text, text_lc, iso_now, now_ts
+
+ROOT = Path(__file__).resolve().parent
+LOGS = ROOT / "Logs"
+
+@dataclass
+class ModerationDecision:
+    action_id: str
+    platform: str
+    user_id: str
+    user_name: str
+    action: str
+    severity: int
+    reason: str
+    source_event_id: str
+    message: str
+    status: str
+    dry_run: int
+    created_ts: float
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+class ModerationGovernor:
+    def __init__(self, db_path=None, config: dict[str, Any] | None = None):
+        self.db_path = resolve_db_path(db_path)
+        self.config = config or {}
+        self.init_schema()
+
+    def connect(self):
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_schema(self):
+        with self.connect() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS moderation_actions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id TEXT UNIQUE, platform TEXT, user_id TEXT, user_name TEXT,
+                action TEXT, severity INTEGER, reason TEXT, source_event_id TEXT, message TEXT,
+                status TEXT, dry_run INTEGER, execute_payload_json TEXT,
+                created_ts REAL, created_at TEXT, executed_ts REAL, executed_at TEXT, error TEXT)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS moderation_user_state(
+                user_id TEXT PRIMARY KEY, user_name TEXT, last_message TEXT,
+                repeat_count INTEGER DEFAULT 0, warning_count INTEGER DEFAULT 0,
+                timeout_count INTEGER DEFAULT 0, last_seen_ts REAL, last_seen_at TEXT)""")
+            conn.commit()
+
+    def _update_user_state(self, user_id: str, user_name: str, normalized_text: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT last_message,repeat_count FROM moderation_user_state WHERE user_id=?", (user_id,)).fetchone()
+            if row is None:
+                repeat = 1
+                conn.execute("""INSERT INTO moderation_user_state(user_id,user_name,last_message,repeat_count,last_seen_ts,last_seen_at)
+                                VALUES(?,?,?,?,?,?)""", (user_id,user_name,normalized_text,repeat,now_ts(),iso_now()))
+            else:
+                repeat = int(row["repeat_count"] or 0) + 1 if str(row["last_message"] or "") == normalized_text else 1
+                conn.execute("""UPDATE moderation_user_state SET user_name=?,last_message=?,repeat_count=?,last_seen_ts=?,last_seen_at=?
+                                WHERE user_id=?""", (user_name,normalized_text,repeat,now_ts(),iso_now(),user_id))
+            conn.commit()
+        return repeat
+
+    def evaluate_twitch_message(self, event: dict[str, Any]) -> ModerationDecision | None:
+        text = normalize_text(event.get("text") or event.get("message") or "")
+        user_id = str(event.get("user_id") or event.get("userId") or event.get("user") or event.get("user_name") or "")
+        user_name = str(event.get("user_name") or event.get("displayName") or event.get("user") or user_id)
+        event_id = str(event.get("event_id") or event.get("message_id") or "")
+        if not text or not user_id:
+            return None
+        protected = {text_lc(x) for x in self.config.get("protected_users", [])}
+        if text_lc(user_id) in protected or text_lc(user_name) in protected:
+            return None
+        lc = text_lc(text)
+        repeat = self._update_user_state(user_id, user_name, lc)
+        banned_terms = [text_lc(x) for x in self.config.get("banned_terms", []) if str(x).strip()]
+        if any(term and term in lc for term in banned_terms):
+            return self.record_decision(user_id,user_name,"ban_candidate",90,"configured_banned_term",event_id,text)
+        if repeat >= 4:
+            return self.record_decision(user_id,user_name,"timeout_candidate",55,"repeat_spam",event_id,text)
+        if re.search(r"(.)\1{12,}", text):
+            return self.record_decision(user_id,user_name,"warn_candidate",25,"char_spam",event_id,text)
+        if len(text) > 500:
+            return self.record_decision(user_id,user_name,"warn_candidate",20,"very_long_message",event_id,text)
+        return None
+
+    def record_decision(self, user_id, user_name, action, severity, reason, source_event_id, message) -> ModerationDecision:
+        dry = 1 if self.config.get("mode","dry_run") != "execute" else 0
+        status = "dry_run" if dry else "pending_execute"
+        d = ModerationDecision(f"mod_{uuid.uuid4().hex[:16]}", "twitch", user_id, user_name, action, int(severity), reason, source_event_id, message, status, dry, now_ts())
+        payload = self.build_streamerbot_payload(d)
+        with self.connect() as conn:
+            conn.execute("""INSERT OR IGNORE INTO moderation_actions(
+                action_id,platform,user_id,user_name,action,severity,reason,source_event_id,message,status,dry_run,execute_payload_json,created_ts,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (d.action_id,d.platform,d.user_id,d.user_name,d.action,d.severity,d.reason,d.source_event_id,d.message,d.status,d.dry_run,json.dumps(payload,ensure_ascii=False),d.created_ts,iso_now()))
+            conn.commit()
+        self._jsonl(LOGS / "moderation_actions.jsonl", d.to_dict() | {"execute_payload": payload})
+        return d
+
+    def build_streamerbot_payload(self, d: ModerationDecision) -> dict[str, Any]:
+        names = self.config.get("streamerbot_action_names", {}) or {}
+        action_name = names.get(d.action, "")
+        return {
+            "request": "DoAction",
+            "id": d.action_id,
+            "action": {"name": action_name} if action_name else {},
+            "args": {
+                "platform": d.platform, "userId": d.user_id, "userName": d.user_name,
+                "reason": d.reason, "severity": d.severity, "sourceEventId": d.source_event_id,
+                "message": d.message, "monikaDryRun": bool(d.dry_run)
+            }
+        }
+
+    def pending_for_execution(self, limit=10) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("""SELECT * FROM moderation_actions WHERE status='pending_execute' AND dry_run=0
+                                   ORDER BY severity DESC, created_ts ASC LIMIT ?""", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_executed(self, action_id: str, status="executed", error=""):
+        with self.connect() as conn:
+            conn.execute("UPDATE moderation_actions SET status=?,error=?,executed_ts=?,executed_at=? WHERE action_id=?",
+                         (status,error,now_ts(),iso_now(),action_id))
+            conn.commit()
+
+    def summary(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            total = conn.execute("SELECT COUNT(*) c FROM moderation_actions").fetchone()["c"]
+            by_status = {r["status"]: r["c"] for r in conn.execute("SELECT status,COUNT(*) c FROM moderation_actions GROUP BY status")}
+            by_action = {r["action"]: r["c"] for r in conn.execute("SELECT action,COUNT(*) c FROM moderation_actions GROUP BY action")}
+        return {"moderation_actions": total, "by_status": by_status, "by_action": by_action}
+
+    @staticmethod
+    def _jsonl(path: Path, obj: dict[str, Any]):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def demo_selftest(db_path) -> dict[str, Any]:
+    gov = ModerationGovernor(db_path, {"mode":"dry_run", "banned_terms":["__forbidden_test_term__"]})
+    assert gov.evaluate_twitch_message({"user_id":"u1","user_name":"viewer","text":"hello"}) is None
+    for _ in range(3):
+        gov.evaluate_twitch_message({"user_id":"u2","user_name":"spammer","text":"spam"})
+    d4 = gov.evaluate_twitch_message({"user_id":"u2","user_name":"spammer","text":"spam"})
+    assert d4 and d4.action == "timeout_candidate" and d4.dry_run == 1, d4
+    d5 = gov.evaluate_twitch_message({"user_id":"u3","user_name":"bad","text":"__forbidden_test_term__"})
+    assert d5 and d5.action == "ban_candidate" and d5.dry_run == 1, d5
+    return gov.summary()

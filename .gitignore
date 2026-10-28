@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.local
+
+# Runtime logs and generated reports
+MonikaBrain/Logs/
+MonikaBrain/crash_log.txt
+MonikaBrain/timing_stats_final.json
+MonikaBrain/last_cleanup.txt
+MonikaBrain/Logs/*.jsonl
+
+# SQLite / ChromaDB runtime data
+*.db
+*.db-wal
+*.db-shm
+MonikaBrain/chroma_engram/
+MonikaBrain/chroma_engram.bak_*/
+MonikaBrain/chroma_engram.bak_noise_*/
+
+# Large local models and Windows-only environments
+MonikaBrain/vosk-model-tts-ru-0.10-multi/
+TTS/venv_tts/
+TTS/asset/
+TTS/ffmpeg/
+TTS/*.wav
+TTS/*.pt
+STT/audio.aac
+
+# Node / browser dependencies
+MonikaBrain/webviewer/node_modules/
+MonikaBrain/webviewer/**/node_modules/
+MonikaBrain/webviewer/cubism-web-sdk/
+MonikaBrain/webviewer/pixi-live2d-display/test/
+
+# Windows-only applications and binaries
+Streamer.bot/
+Speaker.bot/
+*.exe
+*.dll
+*.lnk
+
+# Junk / temporary artifacts
+$body
+tmp_codex_monika_test.txt
+console_chat_hotfix_check.pyc
+*.bak
+
+# macOS
+.DS_Store
+
+# Vendored Live2D library (keep on disk, not in outer git)
+MonikaBrain/webviewer/pixi-live2d-display/

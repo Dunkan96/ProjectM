@@ -1,0 +1,388 @@
+ПОЛНЫЙ ПРОМПТ ПРОЕКТА «МОНИКА» (v4.0)
+Назначение: Этот документ содержит полное описание проекта для передачи контекста в новый чат или другую нейросеть. Прочитай его целиком перед тем как предлагать изменения.
+
+1. СУТЬ ПРОЕКТА
+Моника — AI-VTuber с живым поведением, многослойной памятью, голосом и Live2D-аватаром. Бэкенд написан на Python, аватар отображается в браузере через PIXI.js + Live2D Cubism 4. Управляется текстом с клавиатуры или голосом (Push-to-Talk, клавиша F10). Есть Telegram-бот как второй интерфейс. LLM — локальная модель Qwen3-14B через LM Studio.
+
+Ключевая особенность: Моника — не просто чат-бот. У неё есть граф знаний (SQLite), векторная память диалогов (ChromaDB), социальные отношения с пользователями (доверие, раздражение, модерация), память желаний и мнений, эмоциональная память событий, межсессионная непрерывность диалогов. Всё это собирается в системный промпт для LLM и влияет на тон, длину и содержание ответов.
+
+2. РАСПОЛОЖЕНИЕ
+text
+F:\МоnikaVtuber\MonikaBrain\
+├── console_chat.py              ← ★ ГЛАВНЫЙ ФАЙЛ ★
+├── persona.py                   ← личность, стиль, запреты
+├── behavior_director.py         ← планировщик ответа
+├── builder.py                   ← память (граф + ChromaDB + SQLite)
+├── graph_engine.py              ← движок графа знаний
+├── live_engine.py               ← живое поведение (ритм, интерес, скука)
+├── social_layer.py              ← социальные отношения
+├── desire_memory.py             ← желания Моники
+├── opinion_memory.py            ← мнения и вкусы
+├── emotional_memory.py          ← эмоциональная память
+├── anticipation_engine.py       ← ожидания и возвращения
+├── dialogue_continuity.py       ← сводки прошлых диалогов
+├── affection_state.py           ← аффективное состояние
+├── topic_learner.py             ← обучение темам
+├── prompter.py                  ← инициативные реплики
+├── signals.py                   ← флаги состояния
+├── stimulus.py                  ← дата-класс стимула
+├── stream_router.py             ← роутер стримовых событий
+├── attention_manager.py         ← менеджер внимания
+├── association_trigger.py       ← ассоциативные триггеры
+├── phonetic_ru.py               ← транслитератор англ → рус
+├── stt_ptt.py                   ← распознавание речи (F10)
+├── telegram_bot.py              ← Telegram-бот
+├── config.py                    ← глобальные константы
+├── monika_memory.db             ← граф знаний (entities, facts)
+├── knowledge.db                 ← оперативная память (история, отношения, желания, мнения)
+├── chroma_engram\               ← ChromaDB векторная память диалогов
+└── webviewer\                   ← ★ БРАУЗЕРНЫЙ АВАТАР ★
+    ├── viewer.html              ← ОСНОВНОЙ ФАЙЛ с Live2D
+    ├── RACOON01\                ← модель RACOON (Cubism 3)
+    ├── pixi-live2d-display\     ← библиотека-мост PIXI.js ↔ Live2D
+    └── cubism-web-sdk\          ← оф. Cubism SDK 5 (для тестов)
+3. ПУТИ И КОНСТАНТЫ (config.py)
+STREAMER_ID = "Duncan" — создатель Моники
+
+CREATOR_TELEGRAM_ID = 499084915
+
+LLM_API_BASE = "http://localhost:1234/v1" — LM Studio
+
+LLM_MODEL_NAME = "Aldaris/Qwen3-14B-Q4_K_M-GGUF"
+
+Python: F:\Programs\python3.10-main\python.exe
+
+TTS_CACHE_DIR = "F:\МоnikaVtuber\TTS"
+
+TTS: Silero v5, голос kseniya, sample_rate 48000
+
+STT: faster-whisper, модель "base", язык "ru", клавиша F10
+
+4. АРХИТЕКТУРА СВЯЗИ
+Поток обработки сообщения:
+Пользователь вводит текст (или F10 → STT)
+
+Создаётся Stimulus → priority_queue
+
+generate_response() → process_input():
+
+Проверка на запрещённый контент
+
+Обновление social_layer (отношения)
+
+Проверка специальных запросов (identity, lyrics, experience, repair)
+
+Поиск в памяти (граф + ChromaDB)
+
+LiveEngine.before_plan (ритм, интерес, скука)
+
+BehaviorDirector.plan_response (режим, длина, тон)
+
+Сборка system_prompt (Persona + режим + желания + мнения + отношения + live_context)
+
+LLM-генерация (Qwen3-14B)
+
+Постпроцессинг (очистка от RP, удаление выдуманных воспоминаний, защита от повторов)
+
+TTS (Silero) + отправка эмоций и липсинга на аватар
+
+WebSocket для аватара (ПОРТ 8080):
+Python-сервер в отдельном потоке (start_avatar_ws)
+
+_ws_queue (queue.Queue) для потокобезопасной отправки
+
+_ws_sender() читает очередь и отправляет JSON
+
+send_avatar_emotion(emotion, intensity)
+
+send_avatar_mouth(value) — липсинг
+
+viewer.html подключается по ws://localhost:8080
+
+Липсинг:
+_send_lipsync() — поток, параллельный sd.play()
+
+Чанки по 50 мс, RMS громкости → mouth = min(1.0, rms * 5)
+
+_lip_stop флаг для прерывания старого липсинга новым
+
+После аудио: lip_thread.join(timeout=2.0), принудительное закрытие рта, очистка очереди
+
+5. LIVE2D АВАТАР (viewer.html) — КРИТИЧЕСКИ ВАЖНО
+Загрузка:
+Live2DModel.from('RACOON01/RACOON01.model3.json')
+
+PIXI.js Application, scale=0.45, anchor(0.5,0.5)
+
+Drag-and-drop через PIXI interactive
+
+Отключение авто-слежения за мышкой (ХРУПКИЙ ХАК):
+javascript
+model.internalModel.focusController.active = false;
+model.internalModel.idParamEyeBallX = 'ParamEyeBallX_DISABLED';
+model.internalModel.idParamEyeBallY = 'ParamEyeBallY_DISABLED';
+model.internalModel.idParamAngleX = 'ParamAngleX_DISABLED';
+model.internalModel.idParamAngleY = 'ParamAngleY_DISABLED';
+model.internalModel.idParamAngleZ = 'ParamAngleZ_DISABLED';
+model.internalModel.idParamBodyAngleX = 'ParamBodyAngleX_DISABLED';
+model.internalModel.idParamBodyAngleY = 'ParamBodyAngleY_DISABLED';
+model.internalModel.physics._options.enabled = false;
+Этот хак переименовывает ID параметров на несуществующие, чтобы Cubism Core не мог ими управлять. При обновлении pixi-live2d-display может сломаться.
+
+Автономные движения (setInterval 50ms):
+Голова: ParamAngleX (±7.5°), ParamAngleY (±5°), ParamAngleZ (±6°)
+
+Глаза: ParamEyeBallX/Y (синусоида ±0.1)
+
+Тело: ParamBodyAngleX/Y (малая амплитуда)
+
+Дыхание: ParamBreath (синусоида 0.5 ± 0.15)
+
+Цели обновляются каждые 3-6 секунд, плавное сглаживание 0.03
+
+Эмоции (по WebSocket setEmotion):
+6 эмоций: Happy, Sad, Angry, Surprised, Embarrassed, Suspicious
+Каждая задаёт комбинацию параметров рта, бровей, глаз, щёк.
+
+Липсинг (по WebSocket setMouth):
+ParamMouthOpenY = value * 2
+
+Авто-моргание:
+Каждые 3-5 секунд, закрытие на 80 мс.
+
+6. ПАМЯТЬ
+Граф знаний (monika_memory.db):
+entities (id, name, type, aliases, embedding)
+
+facts (subject_id, predicate, object_id, importance, last_accessed, access_count)
+
+Рейтинг = importance * time_decay * freq_bonus
+
+HALF_LIFE_DAYS = 7
+
+Поиск: нормализация через pymorphy3, эмбеддинги через sentence-transformers
+
+Факты добавляются автоматически и вручную ("запомни факт")
+
+Оперативная память (knowledge.db):
+chat_history, stream_events, topic_weights, user_reputation
+
+relationship_state, monika_desires, monika_opinions
+
+emotional_events, dialogue_sessions
+
+ChromaDB (chroma_engram/):
+Коллекция dialogue_memory для векторного поиска по диалогам
+
+7. ПОВЕДЕНЧЕСКИЕ СЛОИ
+Persona:
+traits: playfulness, curiosity, teasing, warmth, energy, sassiness
+
+micro_desires: "удержать интерес", "мягко поддеть", "превратить сухую тему в живую"
+
+Запреты: RP-формат, философия, канцелярит, "Я — Моника" в каждом ответе
+
+identity_core: "Ты Моника. Говори о себе в женском роде."
+
+BehaviorDirector:
+Режимы: LIVE_REACT, CASUAL_CHAT, PLAYFUL_TEASE, MEMORY_ANSWER, SOFT_SERIOUS
+
+План: max_sentences, max_tokens, use_memory, allow_tease, initiative_allowed
+
+Анализ: social_intent, scene_mood, user_energy, focus_target
+
+loop_detection: при 3+ одинаковых ответах — принудительный сброс
+
+SocialLayer:
+Параметры: affection, trust, irritation, boundary_risk, alliance, friction
+
+Модерация: warn → timeout → ban
+
+Создатель не может быть забанен
+
+Прощение: команда "прости" сбрасывает irritation и moderation_count
+
+DesireMemory:
+want_to_try, want_to_explore, want_to_continue
+
+target_map: ключевые слова → желания
+
+Угасание при times_mentioned >= 10
+
+OpinionMemory:
+likes, dislikes, mixed, interested
+
+Стартовые мнения зашиты в коде
+
+LiveEngine:
+MoodSystem: настроение-фон (playful, soft, careful, neutral)
+
+InterestEngine: скука по темам, подавление надоевших
+
+RhythmEngine: темп диалога
+
+8. LLM ИНТЕГРАЦИЯ
+LM Studio, порт 1234, OpenAI-совместимый API
+
+Модель: Qwen3-14B (GGUF, квантованная)
+
+ОСОБЕННОСТЬ: требует /no_think в промпте чтобы не генерировать <think>-рассуждения
+
+Temperature динамическая (0.55-0.85)
+
+max_tokens: 84-345 в зависимости от плана ответа
+
+Penalties динамические через behavior_director.adjust_sampling
+
+9. ИЗВЕСТНЫЕ ПРОБЛЕМЫ
+АВАВА в конце речи — губы могут дёрнуться после окончания TTS. Не исправлено до конца.
+
+Дублирование get_relevant_desires в desire_memory.py (метод определён дважды).
+
+Иногда повторяет ответы — защита от looping есть, но не всегда срабатывает.
+
+WebSocket-сервер хрупкий — правильная последовательность: run_until_complete → run_forever.
+
+Авто-слежение за мышкой может вернуться при обновлении pixi-live2d-display.
+
+Engram отключён — используется только граф знаний.
+
+Папка Logs/ не добавлена.
+
+10. ЗАПУСК
+start_monika.bat:
+Проверяет наличие Python и console_chat.py
+
+Ждёт подтверждения что LM Studio запущена
+
+Запускает http-server (порт 3000) в папке webviewer
+
+Запускает Монику (python console_chat.py)
+
+Открывает браузер с http://localhost:3000/viewer.html
+
+Ручной запуск:
+Терминал 1: http-server -p 3000 в папке webviewer
+Терминал 2: python console_chat.py
+Браузер: http://localhost:3000/viewer.html
+
+11. ЧТО ЕСТЬ У КОНКУРЕНТОВ (ЮНА) ЧЕГО НЕТ У МОНИКИ
+На основе анализа субтитров с реального стрима:
+
+Реакция на визуальный контекст (видит экран)
+
+Комментирование игры в реальном времени
+
+Звукоподражания и смех в TTS
+
+Импровизационные мини-игры/истории по запросу
+
+Быстрая смена настроения внутри одного ответа
+
+Активное вовлечение чата без команды
+
+Самоирония и признание ошибок с юмором
+
+Абсурдный юмор (овсянка, военкомат, грязные носки)
+
+12. ЧТО ДЕЛАТЬ ДАЛЬШЕ
+Интеграция с Streamer.bot (Twitch чат, донаты, OBS-события)
+
+Доработка липсинга — убрать АВАВА
+
+Улучшение защит от повторов ответов
+
+Добавление мини-игр/историй в поведенческий слой
+
+Улучшение спонтанности и юмора в Persona
+
+Это полный контекст проекта на 28 апреля 2026 года. При использовании в новом чате отправь этот промпт целиком.
+
+F:\МоnikaVtuber\
+│
+├── 📁 MonikaBrain\                    ← ★ КОРЕНЬ ПРОЕКТА ★
+│   │
+│   ├── 📄 console_chat.py             ← ★ ГЛАВНЫЙ ФАЙЛ ★ Точка входа
+│   ├── 📄 persona.py                  ← личность, стиль, запреты, микро-импульсы
+│   ├── 📄 behavior_director.py        ← планировщик поведения и режима ответа
+│   ├── 📄 builder.py                  ← память: граф, ChromaDB, SQLite, история
+│   ├── 📄 graph_engine.py             ← движок графа знаний (SQLite: entities + facts)
+│   ├── 📄 live_engine.py              ← живое поведение: ритм, интерес, скука, настроение
+│   ├── 📄 social_layer.py             ← социальные отношения, модерация
+│   ├── 📄 desire_memory.py            ← желания Моники (хотелки)
+│   ├── 📄 opinion_memory.py           ← устойчивые мнения и вкусы
+│   ├── 📄 emotional_memory.py         ← эмоциональная память событий
+│   ├── 📄 anticipation_engine.py      ← ожидания тем, сюрпризы, возвращения
+│   ├── 📄 dialogue_continuity.py      ← сводки прошлых диалогов, непрерывность
+│   ├── 📄 affection_state.py          ← аффективное состояние, близость, доверие
+│   ├── 📄 topic_learner.py            ← обучение темам (успех/провал)
+│   ├── 📄 prompter.py                 ← инициативные реплики (проактив)
+│   ├── 📄 signals.py                  ← флаги состояния (говорит, думает)
+│   ├── 📄 stimulus.py                 ← дата-класс стимула
+│   ├── 📄 stream_router.py            ← роутер стримовых событий
+│   ├── 📄 attention_manager.py        ← менеджер внимания (приоритеты)
+│   ├── 📄 association_trigger.py      ← ассоциативные триггеры
+│   ├── 📄 phonetic_ru.py              ← транслитератор английских слов для TTS
+│   ├── 📄 stt_ptt.py                  ← распознавание речи (Push-to-Talk, F10)
+│   ├── 📄 telegram_bot.py             ← Telegram-бот (aiogram)
+│   ├── 📄 config.py                   ← глобальные константы и пути
+│   │
+│   ├── 📄 monika_memory.db            ← граф знаний: таблицы entities, facts
+│   ├── 📄 knowledge.db                ← оперативная память: chat_history, stream_events,
+│   │                                      topic_weights, user_reputation, relationship_state,
+│   │                                      monika_desires, monika_opinions, emotional_events,
+│   │                                      dialogue_sessions
+│   │
+│   ├── 📁 chroma_engram\              ← ChromaDB (векторная память)
+│   │   └── 📁 dialogue_memory\        ← коллекция для поиска по диалогам
+│   │
+│   ├── 📄 start_monika.bat            ← ★ ЗАПУСК ★ HTTP-сервер + Python + браузер
+│   │
+│   ├── 📁 Logs\                       ← папка для логов (создаётся авто)
+│   │
+│   ├── 📄 cleanup_junk.py             ← очистка мусорных фактов
+│   ├── 📄 cleanup_mojibake.py         ← исправление кракозябр в памяти
+│   ├── 📄 cleanup_stream_events.py    ← удаление старых сводок
+│   ├── 📄 reset_brain.py              ← полный сброс всей памяти
+│   ├── 📄 reset_topics.py             ← сброс весов тем
+│   ├── 📄 clear_cache.py              ← удаление коллекции ChromaDB
+│   ├── 📄 init_monika_facts.py        ← начальные факты о Монике
+│   ├── 📄 timing_monitor.py           ← мониторинг производительности
+│   │
+│   └── 📁 webviewer\                  ← ★ БРАУЗЕРНЫЙ АВАТАР ★
+│       ├── 📄 viewer.html             ← ★ ОСНОВНОЙ ★ Live2D + WebSocket
+│       ├── 📄 index.html              ← тестовый вьювер (не используется)
+│       ├── 📄 main.js                 ← JS для тестового вьювера
+│       ├── 📄 server.js               ← идея Node.js сервера (не используется)
+│       ├── 📄 package.json            ← npm зависимости
+│       │
+│       ├── 📁 RACOON01\               ← ★ МОДЕЛЬ RACOON ★ Cubism 3
+│       │   ├── 📄 RACOON01.model3.json    ← манифест модели
+│       │   ├── 📄 RACOON01.moc3           ← бинарный файл модели
+│       │   ├── 📄 RACOON01.cdi3.json      ← display info (имена параметров, части)
+│       │   ├── 📄 RACOON01.physics3.json  ← физика (волосы, хвост, грудь, глаза)
+│       │   ├── 📄 RACOON01.vtube.json     ← VTube Studio конфигурация
+│       │   ├── 📄 items_pinned_to_model.json ← закреплённые предметы (пусто)
+│       │   └── 📁 RACOON01.4096\          ← текстуры
+│       │       └── 🖼️ texture_00.png
+│       │
+│       ├── 📁 pixi-live2d-display\    ← ★ БИБЛИОТЕКА-МОСТ ★
+│       │   ├── 📁 core\               ← Cubism Core v4
+│       │   │   ├── 📄 live2d.min.js       ← библиотека Live2D
+│       │   │   └── 📄 live2dcubismcore.js ← Core v4 (для совместимости)
+│       │   ├── 📁 dist\               ← собранные бандлы
+│       │   │   ├── 📄 cubism4.js          ← ★ ОСНОВНОЙ рендерер ★
+│       │   │   ├── 📄 cubism2.js
+│       │   │   └── 📄 index.js
+│       │   ├── 📁 node_modules\       ← npm зависимости
+│       │   └── 📁 cubism\             ← сабмодуль CubismWebFramework
+│       │
+│       └── 📁 cubism-web-sdk\         ← оф. Cubism SDK 5 (для тестов)
+│           ├── 📁 Core\
+│           │   └── 📄 live2dcubismcore.min.js ← Core v5
+│           └── 📁 Framework\
+│               └── 📁 dist\           ← собранный Framework
+│
+├── 📁 TTS\                            ← временные WAV файлы Silero
+│
+└── 📁 Streamer.bot\                   ← программа для автоматизации стримов

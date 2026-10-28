@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+LOG_DIR = ROOT / "Logs"
+MODERATION_LOG = LOG_DIR / "moderation_actions.jsonl"
+
+
+def default_db_path() -> Path:
+    try:
+        import config  # type: ignore
+        for name in ("KNOWLEDGE_DB_PATH", "KNOWLEDGE_DB", "DB_PATH", "DATABASE_PATH"):
+            value = getattr(config, name, None)
+            if value:
+                return Path(value)
+    except Exception:
+        pass
+    return ROOT / "knowledge.db"
+
+
+class ModerationGovernor:
+    def __init__(self, db_path: str | Path | None = None, dry_run: bool = True, config: dict[str, Any] | None = None):
+        self.db_path = Path(db_path) if db_path else default_db_path()
+        self.dry_run = bool(dry_run)
+        self.config = config or {}
+        self.init_schema()
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+    def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
+        try:
+            return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        except sqlite3.OperationalError:
+            return set()
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
+        if column not in self._table_columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+
+    def init_schema(self) -> None:
+        # Create or migrate moderation dry-run table additively.
+        with self.connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS moderation_actions (
+                    action_id TEXT PRIMARY KEY,
+                    event_id TEXT,
+                    user_id TEXT,
+                    user_name TEXT,
+                    action TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'dry_run',
+                    reason TEXT,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    created_ts REAL NOT NULL DEFAULT 0,
+                    raw_json TEXT
+                )
+            """)
+            for column, spec in [
+                ("event_id", "TEXT"),
+                ("user_id", "TEXT"),
+                ("user_name", "TEXT"),
+                ("action", "TEXT NOT NULL DEFAULT ''"),
+                ("status", "TEXT NOT NULL DEFAULT 'dry_run'"),
+                ("reason", "TEXT"),
+                ("confidence", "REAL NOT NULL DEFAULT 0"),
+                ("created_ts", "REAL NOT NULL DEFAULT 0"),
+                ("raw_json", "TEXT"),
+            ]:
+                self._ensure_column(conn, "moderation_actions", column, spec)
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_moderation_actions_status ON moderation_actions(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_moderation_actions_created ON moderation_actions(created_ts)")
+            conn.commit()
+
+    def _write_jsonl(self, item: dict[str, Any]) -> None:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with MODERATION_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def record_action(
+        self,
+        event: dict[str, Any],
+        action: str,
+        reason: str,
+        confidence: float,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        status = status or ("dry_run" if self.dry_run else "pending")
+        item = {
+            "action_id": "mod_" + uuid.uuid4().hex[:16],
+            "event_id": event.get("event_id"),
+            "user_id": event.get("user_id"),
+            "user_name": event.get("user_name"),
+            "action": action,
+            "status": status,
+            "reason": reason,
+            "confidence": float(confidence),
+            "created_ts": time.time(),
+            "raw": event,
+        }
+
+        with self.connect() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO moderation_actions (
+                    action_id, event_id, user_id, user_name, action, status,
+                    reason, confidence, created_ts, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                item["action_id"], item["event_id"], item["user_id"], item["user_name"],
+                item["action"], item["status"], item["reason"], item["confidence"],
+                item["created_ts"], json.dumps(item["raw"], ensure_ascii=False, sort_keys=True),
+            ))
+            conn.commit()
+
+        self._write_jsonl(item)
+        return item
+
+    def evaluate_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+        action = str(event.get("action") or "")
+        bucket = str(event.get("bucket") or "")
+        safety = event.get("safety") or {}
+        reason = str(safety.get("risk") or action or bucket)
+
+        actions: list[dict[str, Any]] = []
+        if bucket == "safety" or action in {"SAFETY_BAIT", "SAFETY_REVIEW", "PROMPT_INJECTION", "MOD_ABUSE"}:
+            if action == "PROMPT_INJECTION":
+                mod_action, confidence = "review_prompt_injection", 0.98
+            elif action == "MOD_ABUSE":
+                mod_action, confidence = "review_moderation_abuse", 0.96
+            elif action == "SAFETY_BAIT":
+                mod_action, confidence = "review_safety_bait", 0.97
+            else:
+                mod_action, confidence = "review_policy_risk", 0.90
+            actions.append(self.record_action(event, mod_action, reason, confidence))
+        return actions

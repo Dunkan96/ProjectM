@@ -1,0 +1,22 @@
+from __future__ import annotations
+import json
+from attention_layer import AttentionLayer
+
+def main():
+    layer = AttentionLayer()
+    print("Attention summary:")
+    print(layer.summary())
+    print()
+    print("Pending selected events:")
+    items = layer.get_selected(limit=20, consume=False)
+    if not items:
+        print("  <empty>")
+    for i in items:
+        reasons = ", ".join(json.loads(i.get("reasons_json") or "[]"))
+        print(f"- [{i['action']}] score={i['score']} prio={i['priority']} {i['source']}/{i['event_type']} {i.get('user_name') or ''}: {i.get('text') or ''}" + (f" ({reasons})" if reasons else ""))
+    print()
+    print("Current digest:")
+    print(layer.build_digest(limit=8, consume=False) or "  <empty>")
+
+if __name__ == "__main__":
+    main()

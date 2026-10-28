@@ -1,0 +1,88 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass
+class NormalizedStreamerBotEvent:
+    event_source: str = ""
+    event_type: str = ""
+    user_id: str = ""
+    user_name: str = ""
+    text: str = ""
+    message_id: str = ""
+    channel: str = ""
+    raw: dict | None = None
+
+    def to_attention_data(self) -> dict[str, Any]:
+        return {
+            "event_id": self.message_id,
+            "messageId": self.message_id,
+            "user_id": self.user_id,
+            "userId": self.user_id,
+            "user_name": self.user_name,
+            "displayName": self.user_name,
+            "username": self.user_name,
+            "login": self.user_name,
+            "message": self.text,
+            "text": self.text,
+            "channel": self.channel,
+        }
+
+
+def _as_dict(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _first_str(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            for key in ("displayName", "name", "login", "username", "userName", "id"):
+                if value.get(key) is not None:
+                    s = str(value.get(key))
+                    if s:
+                        return s
+            continue
+        if isinstance(value, (list, tuple, set)):
+            continue
+        s = str(value)
+        if s:
+            return s
+    return ""
+
+
+def normalize_streamerbot_event(raw: dict) -> NormalizedStreamerBotEvent:
+    raw = raw if isinstance(raw, dict) else {}
+    event = _as_dict(raw.get("event"))
+    data = _as_dict(raw.get("data"))
+    user_obj = _as_dict(data.get("user"))
+
+    user_name = _first_str(
+        data.get("displayName"),
+        data.get("username"),
+        data.get("userName"),
+        data.get("login"),
+        data.get("name"),
+        user_obj,
+    )
+    user_id = _first_str(
+        data.get("userId"),
+        data.get("userID"),
+        data.get("id"),
+        user_obj.get("id"),
+    )
+    text = _first_str(data.get("message"), data.get("text"), data.get("rawInput"), data.get("input"))
+
+    return NormalizedStreamerBotEvent(
+        event_source=_first_str(event.get("source")),
+        event_type=_first_str(event.get("type")),
+        user_id=user_id,
+        user_name=user_name,
+        text=text,
+        message_id=_first_str(data.get("msgId"), data.get("messageId"), data.get("id")),
+        channel=_first_str(data.get("channel"), data.get("channelName"), data.get("broadcasterName")),
+        raw=raw,
+    )

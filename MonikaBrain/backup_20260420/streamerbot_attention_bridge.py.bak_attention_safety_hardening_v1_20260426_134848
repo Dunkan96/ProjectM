@@ -1,0 +1,159 @@
+from __future__ import annotations
+import argparse, asyncio, json, time
+from pathlib import Path
+from typing import Any
+from attention_layer import AttentionLayer, normalize_text
+from moderation_governor import ModerationGovernor
+
+ROOT = Path(__file__).resolve().parent
+LOGS = ROOT / "Logs"
+CONFIG_PATH = ROOT / "streamerbot_attention_config.json"
+
+DEFAULT_CONFIG = {
+  "streamerbot_ws": {
+    "host": "127.0.0.1", "port": 8080, "endpoint": "/", "password": "",
+    "subscribe": {
+      "Twitch": ["ChatMessage","Follow","Cheer","Sub","ReSub","GiftSub","GiftBomb","Raid","RewardRedemption","StreamUpdate","UserTimedOut","UserBanned"],
+      "Obs": ["Connected","Disconnected","SceneChanged","StreamingStarted","StreamingStopped","RecordingStarted","RecordingStopped","Event"]
+    }
+  },
+  "attention": {"consume_after_digest": False, "digest_limit": 8},
+  "moderation": {
+    "mode": "dry_run",
+    "protected_users": ["Duncan"],
+    "banned_terms": [],
+    "streamerbot_action_names": {
+      "warn_candidate": "", "timeout_candidate": "", "ban_candidate": "",
+      "vip_candidate": "", "unvip_candidate": "", "unban_candidate": ""
+    }
+  }
+}
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[config] created {CONFIG_PATH.name}")
+    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    for k, v in data.items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    return cfg
+
+def append_jsonl(path: Path, obj: dict[str, Any]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def normalize_twitch_chat(raw: dict[str, Any]) -> dict[str, Any]:
+    data = raw.get("data") or {}
+    event = raw.get("event") or {}
+    user_obj = data.get("user") if isinstance(data.get("user"), dict) else {}
+    msg_obj = data.get("message") if isinstance(data.get("message"), dict) else {}
+    text = data.get("message") if isinstance(data.get("message"), str) else msg_obj.get("message") or msg_obj.get("text") or data.get("text") or data.get("rawInput") or data.get("input") or ""
+    user_name = data.get("displayName") or data.get("userName") or data.get("username") or data.get("login") or user_obj.get("display") or user_obj.get("name") or user_obj.get("login") or ""
+    user_id = data.get("userId") or data.get("user_id") or user_obj.get("id") or user_name or ""
+    return {"event_id": str(data.get("messageId") or data.get("id") or raw.get("id") or ""),
+            "event_type": event.get("type", "ChatMessage"),
+            "user_id": str(user_id), "user_name": str(user_name), "displayName": str(user_name),
+            "message": normalize_text(str(text)), "raw": raw}
+
+def normalize_obs(raw: dict[str, Any]) -> dict[str, Any]:
+    event = raw.get("event") or {}
+    data = raw.get("data") or {}
+    typ = str(event.get("type") or data.get("event") or data.get("obsEvent.event") or "ObsEvent")
+    scene = data.get("sceneName") or data.get("obs.sceneName") or data.get("obsSceneName") or data.get("newSceneName") or data.get("obsEvent.sceneName") or ""
+    old = data.get("oldSceneName") or data.get("obs.oldSceneName") or ""
+    text = " | ".join([x for x in [f"OBS {typ}", f"{old} -> {scene}" if old and scene else str(scene or "")] if x])
+    return {"source":"obs", "event_type": typ, "text": text, "sceneName": scene, "oldSceneName": old, "raw": raw}
+
+async def send_json(ws, obj):
+    await ws.send(json.dumps(obj, ensure_ascii=False))
+
+async def execute_action(ws, payload: dict[str, Any]) -> bool:
+    if not payload.get("action"):
+        return False
+    await send_json(ws, payload)
+    return True
+
+async def run_bridge(cfg: dict[str, Any]):
+    try:
+        import websockets  # type: ignore
+    except ImportError:
+        raise SystemExit("Missing dependency: websockets. Run: python -m pip install websockets")
+    ws_cfg = cfg["streamerbot_ws"]
+    url = f"ws://{ws_cfg.get('host','127.0.0.1')}:{int(ws_cfg.get('port',8080))}{ws_cfg.get('endpoint','/')}"
+    print(f"[connect] {url}")
+    attention = AttentionLayer()
+    moderation = ModerationGovernor(config=cfg.get("moderation", {}))
+    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+        await send_json(ws, {"request":"GetInfo","id":"monika-get-info"})
+        await send_json(ws, {"request":"Subscribe","id":"monika-attention-subscribe","events": ws_cfg.get("subscribe")})
+        print("[subscribe]", json.dumps(ws_cfg.get("subscribe"), ensure_ascii=False))
+        print("[mode] moderation:", cfg.get("moderation",{}).get("mode","dry_run"))
+        while True:
+            msg = await ws.recv()
+            try:
+                raw = json.loads(msg)
+            except json.JSONDecodeError:
+                append_jsonl(LOGS/"streamerbot_raw_nonjson.log", {"ts":time.time(), "message":msg})
+                continue
+            append_jsonl(LOGS/"streamerbot_raw_events.jsonl", raw)
+            ev = raw.get("event") or {}
+            source = str(ev.get("source") or "")
+            typ = str(ev.get("type") or "")
+            if raw.get("id") in {"monika-get-info","monika-attention-subscribe"}:
+                print("[server]", json.dumps(raw, ensure_ascii=False)[:500])
+                continue
+            if source.casefold() == "twitch" and typ == "ChatMessage":
+                data = normalize_twitch_chat(raw)
+                d = attention.enqueue_twitch_message(data, raw)
+                m = moderation.evaluate_twitch_message({"event_id":d.event_id,"user_id":d.user_id,"user_name":d.user_name,"text":d.text})
+                print(f"[chat:{d.bucket}] {d.user_name}: {d.text} score={d.score} action={d.action}")
+                if m:
+                    print(f"[mod:{m.status}] {m.user_name} {m.action} reason={m.reason}")
+                    if m.dry_run == 0:
+                        for row in moderation.pending_for_execution(limit=3):
+                            payload = json.loads(row.get("execute_payload_json") or "{}")
+                            try:
+                                ok = await execute_action(ws, payload)
+                                moderation.mark_executed(row["action_id"], "executed" if ok else "skipped_no_action")
+                            except Exception as e:
+                                moderation.mark_executed(row["action_id"], "error", str(e))
+            elif source.casefold() == "obs":
+                data = normalize_obs(raw)
+                d = attention.enqueue_vision_event(data, raw)
+                print(f"[obs:{d.bucket}] {d.text} score={d.score}")
+            else:
+                if source or typ:
+                    print(f"[event] {source}.{typ}")
+
+def inject_creator(text: str):
+    d = AttentionLayer().enqueue_creator_message(text)
+    print(json.dumps(d.to_dict(), ensure_ascii=False, indent=2))
+
+def print_digest(consume=False):
+    cfg = load_config()
+    limit = int(cfg.get("attention",{}).get("digest_limit", 8))
+    digest = AttentionLayer().build_digest(limit=limit, consume=consume)
+    print(digest or "<empty>")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--inject-creator")
+    ap.add_argument("--digest", action="store_true")
+    ap.add_argument("--consume", action="store_true")
+    args = ap.parse_args()
+    if args.inject_creator:
+        inject_creator(args.inject_creator); return
+    if args.digest:
+        print_digest(args.consume); return
+    try:
+        asyncio.run(run_bridge(load_config()))
+    except KeyboardInterrupt:
+        print("\\n[stop]")
+
+if __name__ == "__main__":
+    main()
