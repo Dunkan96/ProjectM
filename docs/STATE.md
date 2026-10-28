@@ -50,6 +50,10 @@
   - `docs/tasks/001-macos-port.md`
   - `docs/tasks/002-test-harness.md`
   - `docs/tasks/003-turn-pipeline.md`
+- Инициализирован git, создан baseline-коммит `3b85a46`.
+- `MonikaBrain/webviewer/pixi-live2d-display/` оставлен на диске, но не в git
+  (это вложенный сторонний репозиторий с node_modules). Для работы viewer
+  он должен оставаться на месте.
 
 ## 5. Следующие задачи по порядку
 
@@ -71,7 +75,8 @@
 
 ## 7. Безопасность
 
-- Перед правками: `git init` + baseline commit.
+- Git baseline уже создан: `3b85a46`.
+- Перед каждой задачей: отдельный бранч `bionic/<task>`.
 - Реальные БД: `MonikaBrain/knowledge.db`, `monika_memory.db`,
   `MonikaBrain/chroma_engram/` — не коммитить, не перезаписывать в тестах.
 - Токен Telegram лежит в `config.py` открытым текстом. Если бэкап куда-то
