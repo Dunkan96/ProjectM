@@ -23,8 +23,8 @@ LLM_MODEL_NAME = "Mistral 7B Instruct v0.3"
 KEYWORD = "моника"
 
 # Telegram (отдельный проект)
-TELEGRAM_BOT_TOKEN = "8746762963:AAHWsYb3gLzhFC3G66fPw-1m8HlZmaqNdjk"
-CREATOR_TELEGRAM_ID = 499084915
+TELEGRAM_BOT_TOKEN = ""
+CREATOR_TELEGRAM_ID = 
 TELEGRAM_PROXY_URL = None
 BOT_MODE = "telegram"
 
